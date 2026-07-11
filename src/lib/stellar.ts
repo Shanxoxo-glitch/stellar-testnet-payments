@@ -1,9 +1,29 @@
 import * as StellarSdk from '@stellar/stellar-sdk';
 
-export const TESTNET_HORIZON_URL = 'https://horizon-testnet.stellar.org';
-export const TESTNET_NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
+// ─── Network Config ───────────────────────────────────────────────────────────
 
-export const horizonServer = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+export type NetworkType = 'testnet' | 'mainnet';
+
+export const NETWORKS: Record<NetworkType, { name: string; horizonUrl: string; passphrase: string; friendbot: boolean }> = {
+  testnet: {
+    name: 'Testnet',
+    horizonUrl: 'https://horizon-testnet.stellar.org',
+    passphrase: StellarSdk.Networks.TESTNET,
+    friendbot: true,
+  },
+  mainnet: {
+    name: 'Mainnet (Public)',
+    horizonUrl: 'https://horizon.stellar.org',
+    passphrase: StellarSdk.Networks.PUBLIC,
+    friendbot: false,
+  },
+};
+
+export function getServer(network: NetworkType) {
+  return new StellarSdk.Horizon.Server(NETWORKS[network].horizonUrl);
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 export function formatAddress(address: string): string {
   if (!address || address.length <= 14) return address ?? '';
@@ -31,35 +51,43 @@ export function isValidPublicKey(key: string): boolean {
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   if (typeof error === 'string') return error;
-  // Stellar SDK error with extras
   const e = error as any;
   if (e?.response?.data?.extras?.result_codes) {
     const codes = e.response.data.extras.result_codes;
     return `Transaction failed: ${JSON.stringify(codes)}`;
   }
-  return 'Something went wrong while completing the request.';
+  return 'Something went wrong.';
 }
 
-export async function fetchBalance(address: string): Promise<string> {
-  const account = await horizonServer.loadAccount(address);
+// ─── Account / Balance ───────────────────────────────────────────────────────
+
+/**
+ * Check whether an account exists on-chain.
+ * Returns 'active' | 'inactive' | 'error'
+ */
+export async function checkAccountStatus(
+  address: string,
+  network: NetworkType
+): Promise<'active' | 'inactive'> {
+  try {
+    await getServer(network).loadAccount(address);
+    return 'active';
+  } catch {
+    return 'inactive';
+  }
+}
+
+export async function fetchBalance(address: string, network: NetworkType): Promise<string> {
+  const account = await getServer(network).loadAccount(address);
   const native = account.balances.find((b: any) => b.asset_type === 'native');
   return native?.balance ?? '0';
 }
 
-export async function fundWithFriendbot(address: string): Promise<boolean> {
+export async function fetchRecentTransactions(address: string, network: NetworkType): Promise<any[]> {
   try {
-    const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(address)}`);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-export async function fetchRecentTransactions(address: string): Promise<any[]> {
-  try {
-    const payments = await horizonServer.payments()
+    const payments = await getServer(network).payments()
       .forAccount(address)
-      .limit(8)
+      .limit(10)
       .order('desc')
       .call();
     return payments.records;
@@ -68,19 +96,37 @@ export async function fetchRecentTransactions(address: string): Promise<any[]> {
   }
 }
 
-/**
- * Build a payment transaction XDR from the given parameters.
- * Returns the unsigned XDR string ready to be passed to Freighter.
- */
+// ─── Friendbot ───────────────────────────────────────────────────────────────
+
+export type FriendbotResult = 'funded' | 'already_exists' | 'error';
+
+export async function fundWithFriendbot(address: string, network: NetworkType): Promise<FriendbotResult> {
+  if (!NETWORKS[network].friendbot) return 'error'; // Mainnet has no friendbot
+
+  // First check if already active
+  const status = await checkAccountStatus(address, network);
+  if (status === 'active') return 'already_exists';
+
+  try {
+    const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(address)}`);
+    return res.ok ? 'funded' : 'error';
+  } catch {
+    return 'error';
+  }
+}
+
+// ─── Transactions ─────────────────────────────────────────────────────────────
+
 export async function buildPaymentXdr(
   sourceAddress: string,
   destination: string,
-  amount: string
+  amount: string,
+  network: NetworkType
 ): Promise<string> {
-  const account = await horizonServer.loadAccount(sourceAddress);
+  const account = await getServer(network).loadAccount(sourceAddress);
   const tx = new StellarSdk.TransactionBuilder(account, {
     fee: StellarSdk.BASE_FEE,
-    networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
+    networkPassphrase: NETWORKS[network].passphrase,
   })
     .addOperation(
       StellarSdk.Operation.payment({
@@ -95,27 +141,24 @@ export async function buildPaymentXdr(
   return tx.toXDR();
 }
 
-/**
- * Wraps a signed inner XDR inside a Fee-Bump transaction and broadcasts it.
- * The sponsor keypair pays the network fee so the user pays 0.
- */
 export async function submitFeeBumped(
   signedInnerXdr: string,
-  sponsorSecret: string
+  sponsorSecret: string,
+  network: NetworkType
 ): Promise<StellarSdk.Horizon.HorizonApi.TransactionResponse> {
   const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecret);
   const innerTx = StellarSdk.TransactionBuilder.fromXDR(
     signedInnerXdr,
-    TESTNET_NETWORK_PASSPHRASE
+    NETWORKS[network].passphrase
   ) as StellarSdk.Transaction;
 
   const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
     sponsorKeypair.publicKey(),
     String(Number(innerTx.fee) + 200),
     innerTx,
-    TESTNET_NETWORK_PASSPHRASE
+    NETWORKS[network].passphrase
   );
   feeBump.sign(sponsorKeypair);
 
-  return await horizonServer.submitTransaction(feeBump) as any;
+  return await getServer(network).submitTransaction(feeBump) as any;
 }
