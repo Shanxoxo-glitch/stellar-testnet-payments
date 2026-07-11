@@ -101,6 +101,27 @@ In the prototype, the gateway sponsor is simulated client-side using a Friendbot
 
 ---
 
+## 📸 Screenshots
+
+### 1. User Registration & Network Selector
+![User Registration](public/screenshots/01-wallet-connect.png)
+*Choose between Testnet and Mainnet, enter your name and phone number, and link your Stellar public key.*
+
+### 2. Address Validation & Friendbot Activation
+![Address Validation](public/screenshots/02-connection-request.png)
+*The app performs a real-time account status check. If the address is not yet funded on testnet, Friendbot is automatically triggered to fund it with 10,000 XLM.*
+
+### 3. Interactive Main Dashboard
+![Interactive Main Dashboard](public/screenshots/03-confirm-transaction.png)
+*View your live wallet balance (auto-refreshes every 15 seconds), connect your Freighter wallet to sign transactions cryptographically, and monitor incoming/outgoing transfers.*
+
+### 4. Nokia 3310 USSD Simulator & Gateway Console
+![Nokia USSD Simulator](public/screenshots/04-transaction-success.png)
+*Dial `*123#` on the simulated Nokia 3310 to open the USSD menu. See cellular relayer logs output live in the Gateway Broadcast Console.*
+
+---
+
+
 ## 🔐 The USSD Security Model
 
 ```
@@ -203,7 +224,6 @@ stellar-testnet-payments/
 The 1.4 billion unbanked people who need Stellar the most are currently excluded from it. This project closes that gap.
 
 ---
-<img width="1400" height="1300" alt="image" src="https://github.com/user-attachments/assets/80fac032-d583-4ff9-a005-a6125946ce28" />
 
 
 ## 📄 License
