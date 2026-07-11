@@ -203,6 +203,8 @@ stellar-testnet-payments/
 The 1.4 billion unbanked people who need Stellar the most are currently excluded from it. This project closes that gap.
 
 ---
+<img width="1400" height="1300" alt="image" src="https://github.com/user-attachments/assets/80fac032-d583-4ff9-a005-a6125946ce28" />
+
 
 ## 📄 License
 
