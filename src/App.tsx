@@ -1,572 +1,743 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
-import * as freighterApi from '@stellar/freighter-api';
+import { useEffect, useRef, useState } from 'react';
 import * as StellarSdk from '@stellar/stellar-sdk';
-import WalletBank from './WalletBank';
+import WalletBank, { ContactEntry } from './WalletBank';
+import {
+  deriveKeypairFromPhoneAndPin,
+  fundWithFriendbot,
+  getNativeBalanceFromAccount,
+  getErrorMessage,
+  submitSponsoredTransaction,
+  TESTNET_HORIZON_URL,
+  TESTNET_NETWORK_PASSPHRASE,
+  formatAddress,
+  formatXlm,
+} from './lib/stellar';
 
-type BalanceState = {
-  value: string;
-  loading: boolean;
-  error: string | null;
+type ScreenState =
+  | 'IDLE'
+  | 'DIALING'
+  | 'MENU'
+  | 'BALANCE'
+  | 'SEND_DEST'
+  | 'SEND_AMOUNT'
+  | 'CONFIRM_PIN'
+  | 'TRANSMITTING'
+  | 'SUCCESS'
+  | 'ERROR';
+
+type LogEntry = {
+  id: string;
+  text: string;
+  type: 'info' | 'success' | 'warning' | 'error' | 'packet';
+  time: string;
 };
-
-type TxState = {
-  kind: 'idle' | 'success' | 'error' | 'pending';
-  message: string;
-  hash: string;
-};
-
-type DemoMode = 'none' | 'connected' | 'balance' | 'success';
-
-const freighter = freighterApi as any;
-const horizonServer = new StellarSdk.Horizon.Server('https://horizon-testnet.stellar.org');
-const networkPassphrase = StellarSdk.Networks.TESTNET;
-const demoAddress = 'GDSVYYICF3NRSXGLXQDZBVM337DPXI5TYBGIKWFMUCABWV7H2RKNP7QV';
-const demoHash = '2e7f4c40f5e6d2ef9c70a0f39ff66d5b0d5d5a6c4d1b8c3f0f8a12d9b4c8f77a';
-const contactImage = '/screenshots/contact%20us.png';
-
-function getDemoMode(): DemoMode {
-  if (typeof window === 'undefined') {
-    return 'none';
-  }
-
-  const mode = new URLSearchParams(window.location.search).get('demo');
-
-  if (mode === 'connected' || mode === 'balance' || mode === 'success') {
-    return mode;
-  }
-
-  return 'none';
-}
-
-function getInitialBalance(mode: DemoMode): BalanceState {
-  if (mode === 'balance' || mode === 'success') {
-    return {
-      value: '125.5',
-      loading: false,
-      error: null,
-    };
-  }
-
-  return {
-    value: '0',
-    loading: false,
-    error: null,
-  };
-}
-
-function getInitialTransactionState(mode: DemoMode): TxState {
-  if (mode === 'success') {
-    return {
-      kind: 'success',
-      message: 'Transaction submitted successfully on Stellar testnet.',
-      hash: demoHash,
-    };
-  }
-
-  return {
-    kind: 'idle',
-    message: 'Connect Freighter to start moving testnet XLM.',
-    hash: '',
-  };
-}
-
-function formatAddress(address: string) {
-  if (address.length <= 14) {
-    return address;
-  }
-
-  return `${address.slice(0, 6)}…${address.slice(-6)}`;
-}
-
-function formatBalance(balance: string) {
-  const parsed = Number(balance);
-
-  if (Number.isNaN(parsed)) {
-    return balance;
-  }
-
-  return parsed.toLocaleString('en-US', {
-    minimumFractionDigits: 0,
-    maximumFractionDigits: 7,
-  });
-}
-
-function extractErrorMessage(error: unknown) {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  if (typeof error === 'string') {
-    return error;
-  }
-
-  return 'Something went wrong while completing the request.';
-}
-
-async function fetchNativeBalance(publicKey: string) {
-  const account = await horizonServer.loadAccount(publicKey);
-  const nativeBalance = account.balances.find((entry: any) => entry.asset_type === 'native');
-
-  return nativeBalance?.balance ?? '0';
-}
 
 export default function App() {
-  const demoMode = getDemoMode();
-  const [publicKey, setPublicKey] = useState(() => (demoMode === 'none' ? '' : demoAddress));
-  const [walletError, setWalletError] = useState<string | null>(null);
-  const [walletLoading, setWalletLoading] = useState(false);
-  const [balanceState, setBalanceState] = useState<BalanceState>(() => getInitialBalance(demoMode));
-  const [recipient, setRecipient] = useState('');
-  const [amount, setAmount] = useState('1');
-  const [transactionState, setTransactionState] = useState<TxState>(() => getInitialTransactionState(demoMode));
+  // --- Relayer / Sponsor States ---
+  const [sponsorKeypair, setSponsorKeypair] = useState<StellarSdk.Keypair | null>(null);
+  const [sponsorBalance, setSponsorBalance] = useState('0');
+  const [sponsorLoading, setSponsorLoading] = useState(false);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const consoleEndRef = useRef<HTMLDivElement>(null);
 
-  const isConnected = publicKey.length > 0;
+  // --- Simulated Phone States ---
+  const [phoneNum, setPhoneNum] = useState('+254712345678');
+  const [phonePin, setPhonePin] = useState('1234');
+  const [currentScreen, setCurrentScreen] = useState<ScreenState>('IDLE');
+  const [dialString, setDialString] = useState('');
+  const [menuIndex, setMenuIndex] = useState(0);
+  
+  // Transaction flow inputs on phone
+  const [phoneInput, setPhoneInput] = useState('');
+  const [targetDest, setTargetDest] = useState('');
+  const [targetName, setTargetName] = useState('');
+  const [targetAmount, setTargetAmount] = useState('');
+  const [phoneBalance, setPhoneBalance] = useState('0');
+  const [phoneBalanceLoading, setPhoneBalanceLoading] = useState(false);
+
+  const [lastTxHash, setLastTxHash] = useState('');
+  const [lastError, setLastError] = useState('');
+
+  // Derived account details
+  const derivedKeypair = deriveKeypairFromPhoneAndPin(phoneNum, phonePin);
+  const derivedAddress = derivedKeypair.publicKey();
+
+  // Scroll relayer logs to bottom
+  useEffect(() => {
+    consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
+
+  // Add Log Helper
+  const addLog = (text: string, type: 'info' | 'success' | 'warning' | 'error' | 'packet' = 'info') => {
+    const time = new Date().toLocaleTimeString();
+    setLogs((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, text, type, time }]);
+  };
+
+  // --- Initializing Sponsor Account ---
+  useEffect(() => {
+    const initSponsor = async () => {
+      setSponsorLoading(true);
+      addLog('Initializing Gateway USSD Relayer...', 'info');
+
+      let secret = localStorage.getItem('stellar-ussd-sponsor');
+      let keypair: StellarSdk.Keypair;
+
+      if (secret) {
+        try {
+          keypair = StellarSdk.Keypair.fromSecret(secret);
+        } catch {
+          keypair = StellarSdk.Keypair.random();
+          localStorage.setItem('stellar-ussd-sponsor', keypair.secret());
+        }
+      } else {
+        keypair = StellarSdk.Keypair.random();
+        localStorage.setItem('stellar-ussd-sponsor', keypair.secret());
+      }
+
+      setSponsorKeypair(keypair);
+      addLog(`Sponsor Account Key: ${formatAddress(keypair.publicKey())}`, 'info');
+
+      // Check balance / fund
+      const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+      try {
+        const account = await server.loadAccount(keypair.publicKey());
+        const bal = getNativeBalanceFromAccount(account);
+        setSponsorBalance(bal);
+        addLog(`Sponsor funded. Balance: ${formatXlm(bal)} XLM`, 'success');
+      } catch {
+        addLog('Sponsor account not found. Requesting testnet XLM from Friendbot...', 'warning');
+        const funded = await fundWithFriendbot(keypair.publicKey());
+        if (funded) {
+          try {
+            const account = await server.loadAccount(keypair.publicKey());
+            const bal = getNativeBalanceFromAccount(account);
+            setSponsorBalance(bal);
+            addLog(`Sponsor funded successfully! Balance: ${formatXlm(bal)} XLM`, 'success');
+          } catch (e) {
+            addLog(`Failed to verify sponsor balance: ${getErrorMessage(e)}`, 'error');
+          }
+        } else {
+          addLog('Friendbot failed to fund Sponsor. Please refresh or try again.', 'error');
+        }
+      }
+      setSponsorLoading(false);
+    };
+
+    void initSponsor();
+  }, []);
+
+  // --- Load Phone balance ---
+  const loadPhoneBalance = async (address: string) => {
+    setPhoneBalanceLoading(true);
+    const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+    try {
+      const account = await server.loadAccount(address);
+      const bal = getNativeBalanceFromAccount(account);
+      setPhoneBalance(bal);
+    } catch {
+      setPhoneBalance('0'); // Unactivated
+    } finally {
+      setPhoneBalanceLoading(false);
+    }
+  };
 
   useEffect(() => {
-    if (!publicKey || demoMode !== 'none') {
-      return;
+    if (derivedAddress) {
+      void loadPhoneBalance(derivedAddress);
     }
+  }, [derivedAddress]);
 
-    let isActive = true;
-
-    const refresh = async () => {
-      setBalanceState((current) => ({ ...current, loading: true, error: null }));
-
-      try {
-        const balance = await fetchNativeBalance(publicKey);
-        if (isActive) {
-          setBalanceState({ value: balance, loading: false, error: null });
+  // --- T9 Input Navigation Logic ---
+  const handleKeyPress = (key: string) => {
+    if (currentScreen === 'IDLE') {
+      if (key === '*' || (key >= '0' && key <= '9')) {
+        setDialString(key);
+        setCurrentScreen('DIALING');
+      }
+    } else if (currentScreen === 'DIALING') {
+      if (key === 'END') {
+        setDialString('');
+        setCurrentScreen('IDLE');
+      } else if (key === 'CALL') {
+        if (dialString === '*123#') {
+          addLog(`USSD Session started from phone ${phoneNum} (dialed *123#)`, 'info');
+          setCurrentScreen('MENU');
+          setMenuIndex(0);
+        } else {
+          setLastError('Invalid MMI Code');
+          setCurrentScreen('ERROR');
         }
-      } catch (error) {
-        if (isActive) {
-          setBalanceState({
-            value: '0',
-            loading: false,
-            error: extractErrorMessage(error),
-          });
+      } else if (key === 'BACK') {
+        const next = dialString.slice(0, -1);
+        if (next === '') {
+          setCurrentScreen('IDLE');
+        } else {
+          setDialString(next);
+        }
+      } else {
+        setDialString((prev) => prev + key);
+      }
+    } else if (currentScreen === 'MENU') {
+      if (key === 'END') {
+        addLog('USSD Session closed by user.', 'info');
+        setCurrentScreen('IDLE');
+      } else if (key === '1') {
+        // Check Balance
+        void loadPhoneBalance(derivedAddress);
+        setCurrentScreen('BALANCE');
+      } else if (key === '2') {
+        // Send Payment
+        setPhoneInput('');
+        setTargetDest('');
+        setTargetName('');
+        setCurrentScreen('SEND_DEST');
+      } else if (key === '3') {
+        // My Address
+        setCurrentScreen('BALANCE'); // Just reuse balance view for info
+      } else if (key === '4') {
+        // Reset Phone state
+        setPhoneNum('+254712345678');
+        setPhonePin('1234');
+        addLog('Phone settings reset deterministically.', 'info');
+        setCurrentScreen('IDLE');
+      } else if (key === 'UP') {
+        setMenuIndex((prev) => (prev > 0 ? prev - 1 : 3));
+      } else if (key === 'DOWN') {
+        setMenuIndex((prev) => (prev < 3 ? prev + 1 : 0));
+      } else if (key === 'SELECT') {
+        handleKeyPress((menuIndex + 1).toString());
+      }
+    } else if (currentScreen === 'BALANCE') {
+      if (key === 'END' || key === 'BACK' || key === 'SELECT') {
+        setCurrentScreen('MENU');
+      }
+    } else if (currentScreen === 'SEND_DEST') {
+      if (key === 'END') {
+        setCurrentScreen('IDLE');
+      } else if (key === 'BACK') {
+        setCurrentScreen('MENU');
+      } else if (key === 'CALL' || key === 'SELECT') {
+        if (phoneInput.length >= 10) {
+          setTargetDest(phoneInput);
+          setPhoneInput('');
+          setCurrentScreen('SEND_AMOUNT');
+        }
+      } else if (key === '*') {
+        // Allow pasting or asterisk symbols
+        setPhoneInput((prev) => prev + '*');
+      } else if (key === '#') {
+        setPhoneInput((prev) => prev + '#');
+      } else if (key >= '0' && key <= '9') {
+        setPhoneInput((prev) => prev + key);
+      }
+    } else if (currentScreen === 'SEND_AMOUNT') {
+      if (key === 'END') {
+        setCurrentScreen('IDLE');
+      } else if (key === 'BACK') {
+        setPhoneInput(targetDest);
+        setCurrentScreen('SEND_DEST');
+      } else if (key === 'CALL' || key === 'SELECT') {
+        if (Number(phoneInput) > 0) {
+          setTargetAmount(phoneInput);
+          setPhoneInput('');
+          setCurrentScreen('CONFIRM_PIN');
+        }
+      } else if (key >= '0' && key <= '9') {
+        setPhoneInput((prev) => prev + key);
+      } else if (key === '*') {
+        // serve as decimal point
+        setPhoneInput((prev) => prev + '.');
+      }
+    } else if (currentScreen === 'CONFIRM_PIN') {
+      if (key === 'END') {
+        setCurrentScreen('IDLE');
+      } else if (key === 'BACK') {
+        setPhoneInput(targetAmount);
+        setCurrentScreen('SEND_AMOUNT');
+      } else if (key === 'CALL' || key === 'SELECT') {
+        if (phoneInput === phonePin) {
+          setPhoneInput('');
+          void processOfflinePayment();
+        } else {
+          setLastError('Incorrect PIN');
+          setCurrentScreen('ERROR');
+        }
+      } else if (key >= '0' && key <= '9') {
+        if (phoneInput.length < 4) {
+          setPhoneInput((prev) => prev + key);
         }
       }
-    };
-
-    void refresh();
-
-    return () => {
-      isActive = false;
-    };
-  }, [demoMode, publicKey]);
-
-  const statusTone = useMemo(() => {
-    if (transactionState.kind === 'success') {
-      return 'success';
+    } else if (currentScreen === 'SUCCESS' || currentScreen === 'ERROR') {
+      if (key === 'END' || key === 'BACK' || key === 'SELECT') {
+        setCurrentScreen('IDLE');
+      }
     }
+  };
 
-    if (transactionState.kind === 'error') {
-      return 'error';
+  // --- Trigger offline funding (for testing) ---
+  const triggerFriendbotFunding = async () => {
+    addLog(`Requesting Friendbot activation for client wallet: ${formatAddress(derivedAddress)}`, 'info');
+    const success = await fundWithFriendbot(derivedAddress);
+    if (success) {
+      addLog('Client wallet activated on-chain via Friendbot!', 'success');
+      void loadPhoneBalance(derivedAddress);
+    } else {
+      addLog('Friendbot failed to activate client wallet.', 'error');
     }
+  };
 
-    if (transactionState.kind === 'pending') {
-      return 'pending';
-    }
+  // --- Process USSD Relayer Action ---
+  const processOfflinePayment = async () => {
+    setCurrentScreen('TRANSMITTING');
+    addLog('Offline transaction created on SIM secure element...', 'info');
 
-    return 'neutral';
-  }, [transactionState.kind]);
-
-  async function connectWallet() {
-    setWalletLoading(true);
-    setWalletError(null);
+    // Fetch sequence number (Gateway simulates online state query)
+    const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+    let seqNum = '1';
+    let needsActivation = false;
 
     try {
-      const access = await freighter.requestAccess();
-      if (access?.error) {
-        throw new Error(access.error.message ?? 'Freighter could not grant wallet access.');
+      addLog(`Gateway checking client account state for ${formatAddress(derivedAddress)}...`, 'info');
+      const clientAccount = await server.loadAccount(derivedAddress);
+      seqNum = clientAccount.sequenceNumber();
+    } catch {
+      needsActivation = true;
+      addLog('Client account is unactivated. Gateway will sponsor activation...', 'warning');
+    }
+
+    try {
+      // 1. Build Inner payment transaction
+      let innerTxXdr = '';
+
+      if (needsActivation) {
+        // If the account does not exist, the Gateway must first create it.
+        // We'll simulate creating the account funded by the Sponsor.
+        addLog('Constructing account creation transaction...', 'info');
+        const sponsorAccount = await server.loadAccount(sponsorKeypair!.publicKey());
+        
+        const createAccountTx = new StellarSdk.TransactionBuilder(sponsorAccount, {
+          fee: StellarSdk.BASE_FEE,
+          networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
+        })
+          .addOperation(
+            StellarSdk.Operation.createAccount({
+              destination: derivedAddress,
+              startingBalance: '10', // Sponsor funds 10 XLM
+            })
+          )
+          .setTimeout(30)
+          .build();
+
+        createAccountTx.sign(sponsorKeypair!);
+        addLog('Sponsor executing direct account activation...', 'info');
+        const activeRes = await server.submitTransaction(createAccountTx);
+        addLog(`Client account active in ledger: ${activeRes.ledger}. Proceeding with payment...`, 'success');
+        
+        // Reload sequence
+        const clientAccount = await server.loadAccount(derivedAddress);
+        seqNum = clientAccount.sequenceNumber();
       }
 
-      setPublicKey(access.address);
-      setTransactionState({
-        kind: 'idle',
-        message: 'Wallet connected. Your balance will load automatically.',
-        hash: '',
-      });
-    } catch (error) {
-      setWalletError(extractErrorMessage(error));
-    } finally {
-      setWalletLoading(false);
-    }
-  }
-
-  function disconnectWallet() {
-    setPublicKey('');
-    setRecipient('');
-    setAmount('1');
-    setWalletError(null);
-    setBalanceState({ value: '0', loading: false, error: null });
-    setTransactionState({
-      kind: 'idle',
-      message: 'Wallet disconnected. Reconnect Freighter to continue.',
-      hash: '',
-    });
-  }
-
-  async function refreshBalance() {
-    if (!publicKey) {
-      return;
-    }
-
-    setBalanceState((current) => ({ ...current, loading: true, error: null }));
-
-    try {
-      const balance = await fetchNativeBalance(publicKey);
-      setBalanceState({ value: balance, loading: false, error: null });
-    } catch (error) {
-      setBalanceState({
-        value: '0',
-        loading: false,
-        error: extractErrorMessage(error),
-      });
-    }
-  }
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    if (!publicKey) {
-      setTransactionState({
-        kind: 'error',
-        message: 'Connect your wallet before sending a transaction.',
-        hash: '',
-      });
-      return;
-    }
-
-    if (demoMode !== 'none') {
-      setTransactionState({
-        kind: 'success',
-        message: 'Demo payment completed successfully on Stellar testnet.',
-        hash: demoHash,
+      // Create transaction source dummy account
+      const dummySource = new StellarSdk.Account(derivedAddress, seqNum);
+      
+      const paymentOp = StellarSdk.Operation.payment({
+        destination: targetDest,
+        asset: StellarSdk.Asset.native(),
+        amount: targetAmount,
       });
 
-      return;
-    }
-
-    if (!StellarSdk.StrKey.isValidEd25519PublicKey(recipient.trim())) {
-      setTransactionState({
-        kind: 'error',
-        message: 'Enter a valid Stellar public key that starts with G.',
-        hash: '',
-      });
-      return;
-    }
-
-    if (!amount.trim() || Number(amount) <= 0) {
-      setTransactionState({
-        kind: 'error',
-        message: 'Enter an amount greater than zero.',
-        hash: '',
-      });
-      return;
-    }
-
-    setTransactionState({
-      kind: 'pending',
-      message: 'Preparing and signing the testnet payment…',
-      hash: '',
-    });
-
-    try {
-      const sourceAccount = await horizonServer.loadAccount(publicKey);
-      const transaction = new StellarSdk.TransactionBuilder(sourceAccount, {
+      const innerTx = new StellarSdk.TransactionBuilder(dummySource, {
         fee: StellarSdk.BASE_FEE,
-        networkPassphrase,
+        networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
       })
-        .addOperation(
-          StellarSdk.Operation.payment({
-            destination: recipient.trim(),
-            asset: StellarSdk.Asset.native(),
-            amount: Number(amount).toFixed(7).replace(/0+$/, '').replace(/\.$/, ''),
-          }),
-        )
-        .setTimeout(30)
+        .addOperation(paymentOp)
+        .setTimeout(120)
         .build();
 
-      const signedTransaction = await freighter.signTransaction(transaction.toXDR(), {
-        accountToSign: publicKey,
-        networkPassphrase,
-      });
+      // Sign locally on phone (simulated secure element signing)
+      innerTx.sign(derivedKeypair);
+      innerTxXdr = innerTx.toXDR();
 
-      if (signedTransaction?.error) {
-        throw new Error(signedTransaction.error.message ?? 'Freighter could not sign the transaction.');
-      }
+      // Compress/Serialize XDR into a mock binary USSD payload
+      const encodedPacket = `USSD_PAYLOAD|${phoneNum}|${innerTxXdr.slice(0, 80)}...`;
+      addLog(`Sending raw compressed packet over USSD (120 bytes):`, 'packet');
+      addLog(encodedPacket, 'packet');
 
-      const signedXdr = signedTransaction?.signedTxXdr ?? signedTransaction?.signedTx;
-      if (!signedXdr) {
-        throw new Error('Freighter returned an invalid signed transaction.');
-      }
+      // 2. Gateway receives and unpacks
+      addLog('Gateway Relayer received payload. Verifying signatures...', 'info');
+      addLog('Wrapping inner transaction inside Sponsor Fee-Bump...', 'info');
 
-      const signedTxObj = StellarSdk.TransactionBuilder.fromXDR(signedXdr, networkPassphrase);
-      const response = await horizonServer.submitTransaction(signedTxObj);
+      // 3. Wrap in Fee-Bump and submit
+      const response = await submitSponsoredTransaction(innerTx.toXDR(), sponsorKeypair!.secret());
 
-      setTransactionState({
-        kind: 'success',
-        message: 'Transaction submitted successfully on Stellar testnet.',
-        hash: response.hash,
-      });
+      addLog(`Transaction broadcast successfully!`, 'success');
+      addLog(`Ledger: ${response.ledger} | Hash: ${response.hash}`, 'success');
+      setLastTxHash(response.hash);
 
-      await refreshBalance();
+      // Refresh balances
+      void loadPhoneBalance(derivedAddress);
+      
+      // Update Sponsor balance
+      const sponsorAcct = await server.loadAccount(sponsorKeypair!.publicKey());
+      setSponsorBalance(getNativeBalanceFromAccount(sponsorAcct));
+
+      setCurrentScreen('SUCCESS');
     } catch (error) {
-      setTransactionState({
-        kind: 'error',
-        message: extractErrorMessage(error),
-        hash: '',
-      });
+      const msg = getErrorMessage(error);
+      addLog(`Transaction failed: ${msg}`, 'error');
+      setLastError(msg);
+      setCurrentScreen('ERROR');
     }
-  }
+  };
 
-  function downloadReceipt(hash: string, sender: string, dest: string, xlmAmount: string) {
-    const canvas = document.createElement('canvas');
-    const W = 720;
-    const H = 560;
-    canvas.width = W;
-    canvas.height = H;
-    const ctx = canvas.getContext('2d')!;
-
-    /* ── Background ── */
-    const bg = ctx.createLinearGradient(0, 0, 0, H);
-    bg.addColorStop(0, '#0b1424');
-    bg.addColorStop(1, '#060e1a');
-    ctx.fillStyle = bg;
-    ctx.fillRect(0, 0, W, H);
-
-    /* ── Border glow ── */
-    ctx.strokeStyle = 'rgba(52, 211, 153, 0.35)';
-    ctx.lineWidth = 2;
-    ctx.roundRect(16, 16, W - 32, H - 32, 20);
-    ctx.stroke();
-
-    /* ── Accent bar ── */
-    const accent = ctx.createLinearGradient(40, 0, 260, 0);
-    accent.addColorStop(0, '#34d399');
-    accent.addColorStop(1, '#22c55e');
-    ctx.fillStyle = accent;
-    ctx.roundRect(40, 40, 120, 6, 3);
-    ctx.fill();
-
-    /* ── Title ── */
-    ctx.fillStyle = '#e5eefc';
-    ctx.font = 'bold 28px Inter, sans-serif';
-    ctx.fillText('Transaction Receipt', 40, 88);
-
-    ctx.fillStyle = '#6b84a8';
-    ctx.font = '13px Inter, sans-serif';
-    ctx.fillText('Stellar testnet payment receipt', 40, 112);
-
-    /* ── Divider ── */
-    ctx.strokeStyle = 'rgba(148, 163, 184, 0.15)';
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(40, 130);
-    ctx.lineTo(W - 40, 130);
-    ctx.stroke();
-
-    /* ── Fields ── */
-    const fields = [
-      { label: 'STATUS', value: '✓ Success' },
-      { label: 'NETWORK', value: 'Stellar Testnet' },
-      { label: 'FROM', value: formatAddress(sender) },
-      { label: 'TO', value: dest ? formatAddress(dest) : 'N/A' },
-      { label: 'AMOUNT', value: `${xlmAmount} XLM` },
-      { label: 'TRANSACTION HASH', value: hash },
-      { label: 'DATE', value: new Date().toLocaleString('en-US', { dateStyle: 'full', timeStyle: 'medium' }) },
-    ];
-
-    let y = 160;
-    for (const field of fields) {
-      ctx.fillStyle = '#6b84a8';
-      ctx.font = '600 11px Inter, sans-serif';
-      ctx.fillText(field.label, 40, y);
-
-      ctx.fillStyle = field.label === 'STATUS' ? '#34d399' : '#d5e2f7';
-      ctx.font = field.label === 'TRANSACTION HASH'
-        ? '13px SFMono-Regular, Consolas, monospace'
-        : '15px Inter, sans-serif';
-      ctx.fillText(field.value, 40, y + 20);
-
-      y += 52;
-    }
-
-    /* ── Footer ── */
-    ctx.fillStyle = 'rgba(148, 163, 184, 0.3)';
-    ctx.font = '11px Inter, sans-serif';
-    ctx.fillText('Generated locally for Stellar testnet payments', 40, H - 36);
-
-    /* ── Download ── */
-    const link = document.createElement('a');
-    link.download = `stellar-receipt-${hash.slice(0, 10)}.png`;
-    link.href = canvas.toDataURL('image/png');
-    link.click();
-  }
+  // Handle contact select
+  const handleContactSelect = (contact: ContactEntry) => {
+    addLog(`Loaded contact "${contact.label}" from SIM card memory.`, 'info');
+    setTargetName(contact.label);
+    setTargetDest(contact.address);
+    setPhoneInput(contact.address);
+    setCurrentScreen('SEND_AMOUNT');
+  };
 
   return (
     <main className="shell">
+      {/* Hero Section */}
       <section className="hero">
         <div className="hero__copy">
-          <p className="eyebrow">Level 1 · Testnet</p>
-          <h1>Simple testnet XLM payments with Freighter.</h1>
+          <p className="eyebrow">Level 1 · Offline USSD Bridge</p>
+          <h1>Last-Mile Stellar Payment Bridge</h1>
           <p className="lede">
-            Connect a Stellar wallet, check the connected account balance, and send a real testnet
-            payment with transaction feedback built into the flow.
+            A real-world simulation of an internet-free financial portal. Users sign payments offline 
+            on a retro feature phone using simulated SIM-card key derivation. An online Gateway wraps the 
+            request inside a **Stellar Fee-Bump sponsored transaction**, broadcasting it to the live testnet.
           </p>
         </div>
 
         <div className="hero__panel">
-          <span className="badge">Testnet</span>
+          <span className="badge">Testnet Sandbox</span>
           <div className="hero__panel-media">
-            <img src={contactImage} alt="Contact us" loading="lazy" />
+            <img src="/screenshots/contact us.png" alt="Concept Banner" loading="lazy" />
           </div>
           <div>
-            <span className="hero__panel-title">Contact card</span>
+            <span className="hero__panel-title">Zero-Internet Architecture</span>
             <p className="hero__panel-copy">
-              A focused Stellar testnet payment demo with Freighter wallet connect, live balance
-              checks, and transaction feedback in one simple flow.
+              Showcases sponsored reserves, fee-bumps, and cryptographic signing on basic hardware 
+              to bridge the digital divide.
             </p>
           </div>
         </div>
       </section>
 
+      {/* Main Grid */}
       <section className="grid">
-        <article className="card card--wallet">
+        {/* Left: Phone Simulator Card */}
+        <article className="card card--phone">
           <div className="card__header">
             <div>
-              <p className="card__label">Wallet</p>
-              <h2>Connection</h2>
+              <p className="card__label">Hardware Simulator</p>
+              <h2>Nokia 3310 Engine</h2>
             </div>
-            <span className={`state-pill state-pill--${isConnected ? 'on' : 'off'}`}>
-              {isConnected ? 'Connected' : 'Disconnected'}
+            <span className={`state-pill state-pill--${currentScreen !== 'IDLE' ? 'on' : 'off'}`}>
+              {currentScreen === 'IDLE' ? 'Standby' : 'USSD Active'}
             </span>
           </div>
 
-          <div className="wallet-row">
-            <button className="primary-btn" onClick={connectWallet} disabled={walletLoading}>
-              {walletLoading ? 'Connecting…' : 'Connect Freighter'}
-            </button>
-            <button className="ghost-btn" onClick={disconnectWallet} disabled={!isConnected}>
-              Disconnect
-            </button>
-          </div>
+          <div className="phone-container">
+            <div className="phone-mockup">
+              <div className="phone-earpiece" />
+              
+              {/* LCD Display */}
+              <div className="phone-screen-frame">
+                <div className="phone-screen">
+                  {/* Screen Header */}
+                  <div className="screen-header">
+                    <span>📶 Safaricom</span>
+                    <span>🔋 100%</span>
+                  </div>
 
-          <div className="info-block">
-            <span className="info-block__label">Connected account</span>
-            <p>{isConnected ? formatAddress(publicKey) : 'No wallet connected yet'}</p>
-          </div>
+                  {/* Screen Body */}
+                  <div className="screen-body">
+                    {currentScreen === 'IDLE' && (
+                      <div style={{ textAlign: 'center', marginTop: '24px' }}>
+                        <div style={{ fontSize: '1.2rem', letterSpacing: '0.05em' }}>Stellar SIM</div>
+                        <div style={{ fontSize: '0.68rem', color: '#334155', marginTop: '16px' }}>Dial *123# to start</div>
+                      </div>
+                    )}
 
-          <div className="info-block">
-            <span className="info-block__label">Network</span>
-            <p>Stellar Testnet</p>
-          </div>
+                    {currentScreen === 'DIALING' && (
+                      <div style={{ marginTop: '20px', wordBreak: 'break-all' }}>
+                        <span style={{ fontSize: '1.1rem' }}>{dialString}</span>
+                        <span className="lcd-cursor" />
+                      </div>
+                    )}
 
-          {walletError ? <p className="inline-alert inline-alert--error">{walletError}</p> : null}
-        </article>
+                    {currentScreen === 'MENU' && (
+                      <div>
+                        <div className="menu-title">Stellar USSD</div>
+                        <div className={`menu-option ${menuIndex === 0 ? 'menu-option--selected' : ''}`}>1. Check Balance</div>
+                        <div className={`menu-option ${menuIndex === 1 ? 'menu-option--selected' : ''}`}>2. Send XLM</div>
+                        <div className={`menu-option ${menuIndex === 2 ? 'menu-option--selected' : ''}`}>3. Wallet Info</div>
+                        <div className={`menu-option ${menuIndex === 3 ? 'menu-option--selected' : ''}`}>4. Reset SIM</div>
+                      </div>
+                    )}
 
-        <article className="card card--balance">
-          <div className="card__header">
-            <div>
-              <p className="card__label">Balance</p>
-              <h2>XLM holdings</h2>
-            </div>
-            <button className="ghost-btn ghost-btn--small" onClick={refreshBalance} disabled={!isConnected}>
-              Refresh
-            </button>
-          </div>
+                    {currentScreen === 'BALANCE' && (
+                      <div>
+                        <div className="menu-title">XLM Balance</div>
+                        <div style={{ margin: '10px 0', fontSize: '0.82rem' }}>
+                          {phoneBalanceLoading ? 'Querying...' : `${formatXlm(phoneBalance)} XLM`}
+                        </div>
+                        <div style={{ fontSize: '0.58rem', wordBreak: 'break-all', color: '#1e293b' }}>
+                          Add: {formatAddress(derivedAddress)}
+                        </div>
+                      </div>
+                    )}
 
-          <p className="balance-value">
-            {balanceState.loading ? 'Loading…' : `${formatBalance(balanceState.value)} XLM`}
-          </p>
-          <p className="balance-caption">
-            {isConnected ? 'Fetched live from the testnet account endpoint.' : 'Connect a wallet to display a live balance.'}
-          </p>
+                    {currentScreen === 'SEND_DEST' && (
+                      <div>
+                        <div className="menu-title">Send To:</div>
+                        <div style={{ fontSize: '0.62rem', color: '#1e293b', marginBottom: '4px' }}>
+                          Select contact from list OR paste address below
+                        </div>
+                        <input
+                          type="text"
+                          className="phone-input-line"
+                          value={phoneInput}
+                          onChange={(e) => setPhoneInput(e.target.value)}
+                          placeholder="Phone / G... address"
+                        />
+                      </div>
+                    )}
 
-          {balanceState.error ? (
-            <p className="inline-alert inline-alert--error">{balanceState.error}</p>
-          ) : null}
-        </article>
+                    {currentScreen === 'SEND_AMOUNT' && (
+                      <div>
+                        <div className="menu-title">Amount (XLM):</div>
+                        <div style={{ fontSize: '0.65rem', marginBottom: '8px' }}>
+                          Dest: {targetName || formatAddress(targetDest)}
+                        </div>
+                        <input
+                          type="text"
+                          className="phone-input-line"
+                          value={phoneInput}
+                          onChange={(e) => setPhoneInput(e.target.value)}
+                          placeholder="0.0"
+                        />
+                      </div>
+                    )}
 
-        <article className="card card--form">
-          <div className="card__header">
-            <div>
-              <p className="card__label">Transaction</p>
-              <h2>Send XLM</h2>
-            </div>
-            <span className="state-pill state-pill--accent">Testnet only</span>
-          </div>
+                    {currentScreen === 'CONFIRM_PIN' && (
+                      <div>
+                        <div className="menu-title">Enter PIN:</div>
+                        <div style={{ fontSize: '0.65rem', marginBottom: '10px' }}>
+                          Send {targetAmount} XLM to {targetName || formatAddress(targetDest)}?
+                        </div>
+                        <div style={{ textAlign: 'center' }}>
+                          <span style={{ fontSize: '1.2rem', letterSpacing: '0.2em' }}>
+                            {'*'.repeat(phoneInput.length) || '_'}
+                          </span>
+                        </div>
+                      </div>
+                    )}
 
-          <form className="form" onSubmit={handleSubmit}>
-            <label>
-              Destination address
-              <input
-                type="password"
-                value={recipient}
-                readOnly
-                onPaste={(e) => {
-                  e.preventDefault();
-                  const pasted = e.clipboardData.getData('text').trim();
-                  if (pasted) setRecipient(pasted);
-                }}
-                onCopy={(e) => e.preventDefault()}
-                onCut={(e) => e.preventDefault()}
-                onDragStart={(e) => e.preventDefault()}
-                placeholder="Paste address here…"
-                spellCheck={false}
-                autoComplete="off"
-                style={{ userSelect: 'none', WebkitUserSelect: 'none' } as React.CSSProperties}
-              />
-            </label>
+                    {currentScreen === 'TRANSMITTING' && (
+                      <div style={{ textAlign: 'center', marginTop: '24px' }}>
+                        <div>🛰️ USSD PACKET</div>
+                        <div style={{ fontSize: '0.68rem', marginTop: '10px', color: '#334155' }}>
+                          Transmitting packet via cell tower...
+                        </div>
+                      </div>
+                    )}
 
-            <label>
-              Amount in XLM
-              <input
-                type="number"
-                min="0.0000001"
-                step="0.0000001"
-                value={amount}
-                onChange={(event) => setAmount(event.target.value)}
-                placeholder="1.0"
-              />
-            </label>
+                    {currentScreen === 'SUCCESS' && (
+                      <div style={{ textAlign: 'center', marginTop: '16px' }}>
+                        <div>✅ Success</div>
+                        <div style={{ fontSize: '0.68rem', marginTop: '8px' }}>
+                          Sent {targetAmount} XLM.
+                        </div>
+                        <div style={{ fontSize: '0.55rem', color: '#1e293b', marginTop: '8px' }}>
+                          Hash: {lastTxHash.slice(0, 12)}...
+                        </div>
+                      </div>
+                    )}
 
-            <button className="primary-btn" type="submit" disabled={!isConnected}>
-              Send payment
-            </button>
-          </form>
-        </article>
+                    {currentScreen === 'ERROR' && (
+                      <div style={{ marginTop: '8px' }}>
+                        <div style={{ color: '#7f1d1d' }}>⚠️ Error</div>
+                        <div style={{ fontSize: '0.6rem', marginTop: '4px', overflowY: 'auto', maxHeight: '110px' }}>
+                          {lastError}
+                        </div>
+                      </div>
+                    )}
+                  </div>
 
-        <WalletBank onSelect={(addr) => setRecipient(addr)} />
-
-        <article className={`card card--feedback card--${statusTone}`}>
-          <div className="card__header">
-            <div>
-              <p className="card__label">Feedback</p>
-              <h2>Transaction result</h2>
-            </div>
-            <span className={`state-pill state-pill--${statusTone}`}>{transactionState.kind}</span>
-          </div>
-
-          <p className="feedback-message">{transactionState.message}</p>
-
-          {transactionState.hash ? (
-            <>
-              <div className="info-block">
-                <span className="info-block__label">Transaction hash</span>
-                <p className="hash-value">{transactionState.hash}</p>
+                  {/* Screen Footer */}
+                  <div className="screen-footer">
+                    <span>
+                      {currentScreen === 'MENU' || currentScreen === 'SEND_DEST' || currentScreen === 'SEND_AMOUNT' || currentScreen === 'CONFIRM_PIN' ? 'Back' : ''}
+                    </span>
+                    <span>
+                      {currentScreen === 'IDLE' ? 'Dial' : currentScreen === 'MENU' ? 'Select' : 'OK'}
+                    </span>
+                  </div>
+                </div>
               </div>
 
-              <button
-                className="receipt-btn"
-                type="button"
-                onClick={() => downloadReceipt(transactionState.hash, publicKey, recipient, amount)}
-              >
-                ⬇ Download Receipt
+              {/* Navigation softkeys */}
+              <div className="phone-softkeys">
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('BACK')}>
+                  ⬅ Back
+                </button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('UP')}>
+                  ▲ Up
+                </button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('SELECT')}>
+                  OK
+                </button>
+              </div>
+
+              {/* Main Call/End Row */}
+              <div className="phone-softkeys" style={{ marginTop: '8px' }}>
+                <button className="phone-btn phone-btn--call" onClick={() => handleKeyPress('CALL')}>
+                  📞 Call
+                </button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('DOWN')}>
+                  ▼ Down
+                </button>
+                <button className="phone-btn phone-btn--end" onClick={() => handleKeyPress('END')}>
+                  ❌ End
+                </button>
+              </div>
+
+              {/* Numeric Keypad */}
+              <div className="phone-keypad">
+                {[
+                  { num: '1', let: 'o_o' },
+                  { num: '2', let: 'abc' },
+                  { num: '3', let: 'def' },
+                  { num: '4', let: 'ghi' },
+                  { num: '5', let: 'jkl' },
+                  { num: '6', let: 'mno' },
+                  { num: '7', let: 'pqrs' },
+                  { num: '8', let: 'tuv' },
+                  { num: '9', let: 'wxyz' },
+                  { num: '*', let: '.' },
+                  { num: '0', let: 'space' },
+                  { num: '#', let: 'caps' },
+                ].map((k) => (
+                  <button key={k.num} className="phone-btn" onClick={() => handleKeyPress(k.num)}>
+                    <span className="phone-btn__num">{k.num}</span>
+                    <span className="phone-btn__letters">{k.let}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </article>
+
+        {/* Right: Gateway / Relayer Console Card */}
+        <article className="card card--gateway">
+          <div className="card__header">
+            <div>
+              <p className="card__label">Cellular Relayer Gateway</p>
+              <h2>Stellar Broadcast Console</h2>
+            </div>
+            <span className="state-pill state-pill--accent">Sponsor Fee Pay Enabled</span>
+          </div>
+
+          <div className="gateway-console">
+            {/* Info grid */}
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+              <div className="info-block">
+                <span className="info-block__label">Sponsor Address</span>
+                <p style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
+                  {sponsorKeypair ? formatAddress(sponsorKeypair.publicKey()) : 'Loading...'}
+                </p>
+              </div>
+              <div className="info-block">
+                <span className="info-block__label">Sponsor Balance</span>
+                <p style={{ fontWeight: 'bold' }}>
+                  {sponsorLoading ? 'Fetching...' : `${formatXlm(sponsorBalance)} XLM`}
+                </p>
+              </div>
+            </div>
+
+            {/* Terminal Monitor */}
+            <div className="console-monitor">
+              {logs.length === 0 ? (
+                <p className="console-line console-line--info">Waiting for incoming USSD connection...</p>
+              ) : (
+                logs.map((log) => (
+                  <p key={log.id} className={`console-line console-line--${log.type}`}>
+                    [{log.time}] {log.text}
+                  </p>
+                ))
+              )}
+              <div ref={consoleEndRef} />
+            </div>
+
+            {/* Operations controls */}
+            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
+              <button className="primary-btn" onClick={triggerFriendbotFunding}>
+                ⚡ Register Phone Address (Friendbot)
               </button>
-            </>
-          ) : null}
+              <button
+                className="ghost-btn"
+                onClick={() => {
+                  setLogs([]);
+                  addLog('Logs cleared. Relayer ready.', 'info');
+                }}
+              >
+                Clear Console Logs
+              </button>
+            </div>
+          </div>
+        </article>
+
+        {/* Left Bottom: SIM Contacts */}
+        <WalletBank onSelect={handleContactSelect} />
+
+        {/* Right Bottom: Tech/Education Specs */}
+        <article className="card card--education">
+          <div className="card__header">
+            <div>
+              <p className="card__label">Protocol Documentation</p>
+              <h2>How Offline Bridge Works</h2>
+            </div>
+            <span className="state-pill state-pill--neutral">Level 1 Architecture</span>
+          </div>
+
+          <div className="edu-grid">
+            <div className="edu-item">
+              <h4>1. Sim-based Key Derivation</h4>
+              <p>
+                Instead of storing secret keys online, the simulated phone derives a private/public keypair deterministically 
+                from the <strong>Phone Number</strong> and a <strong>4-digit PIN</strong>. This replicates standard secure elements 
+                (SIM cards) storing secrets offline.
+              </p>
+            </div>
+            <div className="edu-item">
+              <h4>2. USSD Session Dialog</h4>
+              <p>
+                Users dial <code>*123#</code> to establish a real-time GSM channel. The gateway responds with numbered text options. 
+                This requires zero internet connection or mobile data, running on basic cellular towers.
+              </p>
+            </div>
+            <div className="edu-item">
+              <h4>3. Offline Signature Packaging</h4>
+              <p>
+                Once transaction parameters are confirmed, the phone uses its offline key to sign the transaction XDR. The signature 
+                and payload are packed into a compressed format, sent back over the cellular network.
+              </p>
+            </div>
+            <div className="edu-item">
+              <h4>4. Sponsored Fee-Bumping</h4>
+              <p>
+                The Gateway Relayer intercepts the payload. To make it completely free for the unbanked user, the Gateway wraps the 
+                transaction in a <strong>Stellar Fee-Bump Transaction</strong>. The Sponsor pays the network fee, and submits it to Horizon.
+              </p>
+            </div>
+          </div>
         </article>
       </section>
     </main>
