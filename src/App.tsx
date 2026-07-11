@@ -192,11 +192,26 @@ export default function App() {
     const keypair = deriveKeypairFromPhoneAndPin(regPhone, regPin);
     const address = keypair.publicKey();
 
-    addLog(`Creating SIM card profiles for ${regName}...`, 'info');
+    addLog(`Creating SIM card profile for ${regName}...`, 'info');
     addLog(`Derived Stellar address: ${formatAddress(address)}`, 'info');
-    addLog('Requesting on-chain SIM activation via Friendbot...', 'warning');
 
-    const success = await fundWithFriendbot(address);
+    // Check if account already exists to avoid Friendbot 400 error
+    const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+    let accountExists = false;
+    try {
+      await server.loadAccount(address);
+      accountExists = true;
+      addLog('SIM address is already active on-chain.', 'info');
+    } catch {
+      // 404 is normal for unactivated accounts
+    }
+
+    let success = true;
+    if (!accountExists) {
+      addLog('SIM is inactive. Requesting testnet XLM activation via Friendbot...', 'warning');
+      success = await fundWithFriendbot(address);
+    }
+
     if (success) {
       const profile: UserProfile = {
         name: regName.trim(),
@@ -207,10 +222,10 @@ export default function App() {
 
       localStorage.setItem('stellar-user-profile', JSON.stringify(profile));
       setIsRegistered(true);
-      addLog(`SIM Profile activated successfully! Derived wallet funded.`, 'success');
+      addLog(`SIM Profile activated successfully!${accountExists ? '' : ' Wallet funded.'}`, 'success');
       void loadPhoneBalance(address);
     } else {
-      setRegError('Friendbot funding failed. Please check internet connection or try again.');
+      setRegError('SIM activation failed. Friendbot could not fund the address. Please try again.');
       addLog('On-chain SIM activation failed.', 'error');
     }
     setRegLoading(false);
