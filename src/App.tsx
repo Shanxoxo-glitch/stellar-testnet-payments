@@ -32,7 +32,22 @@ type LogEntry = {
   time: string;
 };
 
+type UserProfile = {
+  name: string;
+  phone: string;
+  pin: string;
+  address: string;
+};
+
 export default function App() {
+  // --- User Profile & Registration States ---
+  const [isRegistered, setIsRegistered] = useState(false);
+  const [regName, setRegName] = useState('');
+  const [regPhone, setRegPhone] = useState('+254712345678');
+  const [regPin, setRegPin] = useState('1234');
+  const [regLoading, setRegLoading] = useState(false);
+  const [regError, setRegError] = useState<string | null>(null);
+
   // --- Relayer / Sponsor States ---
   const [sponsorKeypair, setSponsorKeypair] = useState<StellarSdk.Keypair | null>(null);
   const [sponsorBalance, setSponsorBalance] = useState('0');
@@ -41,8 +56,6 @@ export default function App() {
   const consoleEndRef = useRef<HTMLDivElement>(null);
 
   // --- Simulated Phone States ---
-  const [phoneNum, setPhoneNum] = useState('+254712345678');
-  const [phonePin, setPhonePin] = useState('1234');
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('IDLE');
   const [dialString, setDialString] = useState('');
   const [menuIndex, setMenuIndex] = useState(0);
@@ -58,11 +71,7 @@ export default function App() {
   const [lastTxHash, setLastTxHash] = useState('');
   const [lastError, setLastError] = useState('');
 
-  // Derived account details
-  const derivedKeypair = deriveKeypairFromPhoneAndPin(phoneNum, phonePin);
-  const derivedAddress = derivedKeypair.publicKey();
-
-  // Scroll relayer logs to bottom
+  // Auto-scroll logs
   useEffect(() => {
     consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
@@ -73,9 +82,25 @@ export default function App() {
     setLogs((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, text, type, time }]);
   };
 
-  // --- Initializing Sponsor Account ---
+  // --- Load Profile & Sponsor on mount ---
   useEffect(() => {
-    const initSponsor = async () => {
+    const loadProfileAndSponsor = async () => {
+      // 1. Check existing user profile
+      const storedProfile = localStorage.getItem('stellar-user-profile');
+      if (storedProfile) {
+        try {
+          const profile = JSON.parse(storedProfile) as UserProfile;
+          setRegName(profile.name);
+          setRegPhone(profile.phone);
+          setRegPin(profile.pin);
+          setIsRegistered(true);
+          addLog(`Restored active SIM profile: ${profile.name} (${profile.phone})`, 'info');
+        } catch {
+          localStorage.removeItem('stellar-user-profile');
+        }
+      }
+
+      // 2. Initialize Sponsor Keypair
       setSponsorLoading(true);
       addLog('Initializing Gateway USSD Relayer...', 'info');
 
@@ -97,7 +122,6 @@ export default function App() {
       setSponsorKeypair(keypair);
       addLog(`Sponsor Account Key: ${formatAddress(keypair.publicKey())}`, 'info');
 
-      // Check balance / fund
       const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
       try {
         const account = await server.loadAccount(keypair.publicKey());
@@ -123,11 +147,18 @@ export default function App() {
       setSponsorLoading(false);
     };
 
-    void initSponsor();
+    void loadProfileAndSponsor();
   }, []);
 
-  // --- Load Phone balance ---
+  // Compute active derived address based on profile details
+  const activeKeypair = (regPhone && regPin.length === 4)
+    ? deriveKeypairFromPhoneAndPin(regPhone, regPin)
+    : null;
+  const activeAddress = activeKeypair ? activeKeypair.publicKey() : '';
+
+  // Load Phone balance
   const loadPhoneBalance = async (address: string) => {
+    if (!address) return;
     setPhoneBalanceLoading(true);
     const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
     try {
@@ -142,10 +173,61 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (derivedAddress) {
-      void loadPhoneBalance(derivedAddress);
+    if (isRegistered && activeAddress) {
+      void loadPhoneBalance(activeAddress);
     }
-  }, [derivedAddress]);
+  }, [isRegistered, activeAddress]);
+
+  // --- Registration / Activation Handler ---
+  const handleActivateSIM = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!regName.trim() || !regPhone.trim() || regPin.length !== 4) {
+      setRegError('Please provide a Name, Phone Number, and 4-Digit PIN.');
+      return;
+    }
+
+    setRegLoading(true);
+    setRegError(null);
+
+    const keypair = deriveKeypairFromPhoneAndPin(regPhone, regPin);
+    const address = keypair.publicKey();
+
+    addLog(`Creating SIM card profiles for ${regName}...`, 'info');
+    addLog(`Derived Stellar address: ${formatAddress(address)}`, 'info');
+    addLog('Requesting on-chain SIM activation via Friendbot...', 'warning');
+
+    const success = await fundWithFriendbot(address);
+    if (success) {
+      const profile: UserProfile = {
+        name: regName.trim(),
+        phone: regPhone.trim(),
+        pin: regPin,
+        address,
+      };
+
+      localStorage.setItem('stellar-user-profile', JSON.stringify(profile));
+      setIsRegistered(true);
+      addLog(`SIM Profile activated successfully! Derived wallet funded.`, 'success');
+      void loadPhoneBalance(address);
+    } else {
+      setRegError('Friendbot funding failed. Please check internet connection or try again.');
+      addLog('On-chain SIM activation failed.', 'error');
+    }
+    setRegLoading(false);
+  };
+
+  // --- Deactivate / Logout SIM ---
+  const handleDeactivateSIM = () => {
+    localStorage.removeItem('stellar-user-profile');
+    setIsRegistered(false);
+    setRegName('');
+    setRegPhone('+254712345678');
+    setRegPin('1234');
+    setPhoneBalance('0');
+    setCurrentScreen('IDLE');
+    setDialString('');
+    addLog('SIM Profile deactivated and cleared from local memory.', 'warning');
+  };
 
   // --- T9 Input Navigation Logic ---
   const handleKeyPress = (key: string) => {
@@ -160,7 +242,7 @@ export default function App() {
         setCurrentScreen('IDLE');
       } else if (key === 'CALL') {
         if (dialString === '*123#') {
-          addLog(`USSD Session started from phone ${phoneNum} (dialed *123#)`, 'info');
+          addLog(`USSD Session started from phone ${regPhone} (${regName})`, 'info');
           setCurrentScreen('MENU');
           setMenuIndex(0);
         } else {
@@ -183,7 +265,7 @@ export default function App() {
         setCurrentScreen('IDLE');
       } else if (key === '1') {
         // Check Balance
-        void loadPhoneBalance(derivedAddress);
+        void loadPhoneBalance(activeAddress);
         setCurrentScreen('BALANCE');
       } else if (key === '2') {
         // Send Payment
@@ -192,14 +274,11 @@ export default function App() {
         setTargetName('');
         setCurrentScreen('SEND_DEST');
       } else if (key === '3') {
-        // My Address
-        setCurrentScreen('BALANCE'); // Just reuse balance view for info
+        // My Address info
+        setCurrentScreen('BALANCE');
       } else if (key === '4') {
-        // Reset Phone state
-        setPhoneNum('+254712345678');
-        setPhonePin('1234');
-        addLog('Phone settings reset deterministically.', 'info');
-        setCurrentScreen('IDLE');
+        // Deactivate SIM
+        handleDeactivateSIM();
       } else if (key === 'UP') {
         setMenuIndex((prev) => (prev > 0 ? prev - 1 : 3));
       } else if (key === 'DOWN') {
@@ -223,7 +302,6 @@ export default function App() {
           setCurrentScreen('SEND_AMOUNT');
         }
       } else if (key === '*') {
-        // Allow pasting or asterisk symbols
         setPhoneInput((prev) => prev + '*');
       } else if (key === '#') {
         setPhoneInput((prev) => prev + '#');
@@ -245,7 +323,6 @@ export default function App() {
       } else if (key >= '0' && key <= '9') {
         setPhoneInput((prev) => prev + key);
       } else if (key === '*') {
-        // serve as decimal point
         setPhoneInput((prev) => prev + '.');
       }
     } else if (currentScreen === 'CONFIRM_PIN') {
@@ -255,7 +332,7 @@ export default function App() {
         setPhoneInput(targetAmount);
         setCurrentScreen('SEND_AMOUNT');
       } else if (key === 'CALL' || key === 'SELECT') {
-        if (phoneInput === phonePin) {
+        if (phoneInput === regPin) {
           setPhoneInput('');
           void processOfflinePayment();
         } else {
@@ -274,31 +351,19 @@ export default function App() {
     }
   };
 
-  // --- Trigger offline funding (for testing) ---
-  const triggerFriendbotFunding = async () => {
-    addLog(`Requesting Friendbot activation for client wallet: ${formatAddress(derivedAddress)}`, 'info');
-    const success = await fundWithFriendbot(derivedAddress);
-    if (success) {
-      addLog('Client wallet activated on-chain via Friendbot!', 'success');
-      void loadPhoneBalance(derivedAddress);
-    } else {
-      addLog('Friendbot failed to activate client wallet.', 'error');
-    }
-  };
-
   // --- Process USSD Relayer Action ---
   const processOfflinePayment = async () => {
+    if (!activeKeypair) return;
     setCurrentScreen('TRANSMITTING');
-    addLog('Offline transaction created on SIM secure element...', 'info');
+    addLog('Offline transaction signed on SIM secure element...', 'info');
 
-    // Fetch sequence number (Gateway simulates online state query)
     const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
     let seqNum = '1';
     let needsActivation = false;
 
     try {
-      addLog(`Gateway checking client account state for ${formatAddress(derivedAddress)}...`, 'info');
-      const clientAccount = await server.loadAccount(derivedAddress);
+      addLog(`Gateway checking client account state for ${formatAddress(activeAddress)}...`, 'info');
+      const clientAccount = await server.loadAccount(activeAddress);
       seqNum = clientAccount.sequenceNumber();
     } catch {
       needsActivation = true;
@@ -306,12 +371,9 @@ export default function App() {
     }
 
     try {
-      // 1. Build Inner payment transaction
       let innerTxXdr = '';
 
       if (needsActivation) {
-        // If the account does not exist, the Gateway must first create it.
-        // We'll simulate creating the account funded by the Sponsor.
         addLog('Constructing account creation transaction...', 'info');
         const sponsorAccount = await server.loadAccount(sponsorKeypair!.publicKey());
         
@@ -321,7 +383,7 @@ export default function App() {
         })
           .addOperation(
             StellarSdk.Operation.createAccount({
-              destination: derivedAddress,
+              destination: activeAddress,
               startingBalance: '10', // Sponsor funds 10 XLM
             })
           )
@@ -333,13 +395,11 @@ export default function App() {
         const activeRes = await server.submitTransaction(createAccountTx);
         addLog(`Client account active in ledger: ${activeRes.ledger}. Proceeding with payment...`, 'success');
         
-        // Reload sequence
-        const clientAccount = await server.loadAccount(derivedAddress);
+        const clientAccount = await server.loadAccount(activeAddress);
         seqNum = clientAccount.sequenceNumber();
       }
 
-      // Create transaction source dummy account
-      const dummySource = new StellarSdk.Account(derivedAddress, seqNum);
+      const dummySource = new StellarSdk.Account(activeAddress, seqNum);
       
       const paymentOp = StellarSdk.Operation.payment({
         destination: targetDest,
@@ -355,30 +415,24 @@ export default function App() {
         .setTimeout(120)
         .build();
 
-      // Sign locally on phone (simulated secure element signing)
-      innerTx.sign(derivedKeypair);
+      innerTx.sign(activeKeypair);
       innerTxXdr = innerTx.toXDR();
 
-      // Compress/Serialize XDR into a mock binary USSD payload
-      const encodedPacket = `USSD_PAYLOAD|${phoneNum}|${innerTxXdr.slice(0, 80)}...`;
+      const encodedPacket = `USSD_PAYLOAD|${regPhone}|${innerTxXdr.slice(0, 80)}...`;
       addLog(`Sending raw compressed packet over USSD (120 bytes):`, 'packet');
       addLog(encodedPacket, 'packet');
 
-      // 2. Gateway receives and unpacks
       addLog('Gateway Relayer received payload. Verifying signatures...', 'info');
       addLog('Wrapping inner transaction inside Sponsor Fee-Bump...', 'info');
 
-      // 3. Wrap in Fee-Bump and submit
       const response = await submitSponsoredTransaction(innerTx.toXDR(), sponsorKeypair!.secret());
 
       addLog(`Transaction broadcast successfully!`, 'success');
       addLog(`Ledger: ${response.ledger} | Hash: ${response.hash}`, 'success');
       setLastTxHash(response.hash);
 
-      // Refresh balances
-      void loadPhoneBalance(derivedAddress);
+      void loadPhoneBalance(activeAddress);
       
-      // Update Sponsor balance
       const sponsorAcct = await server.loadAccount(sponsorKeypair!.publicKey());
       setSponsorBalance(getNativeBalanceFromAccount(sponsorAcct));
 
@@ -400,17 +454,106 @@ export default function App() {
     setCurrentScreen('SEND_AMOUNT');
   };
 
+  // --- RENDER REGISTRATION SCREEN ---
+  if (!isRegistered) {
+    return (
+      <main className="shell">
+        <section className="hero" style={{ marginBottom: '32px' }}>
+          <div className="hero__copy">
+            <p className="eyebrow">Level 1 · SIM Activation</p>
+            <h1>Last-Mile Offline Payment Bridge</h1>
+            <p className="lede">
+              Welcome to the Stellar Last-Mile prototype. To simulate an offline feature phone transacting 
+              without internet, you must first register your profile and activate your local SIM card on the 
+              Stellar Testnet.
+            </p>
+          </div>
+        </section>
+
+        <section style={{ maxWidth: '600px', margin: '0 auto' }}>
+          <article className="card">
+            <div className="card__header">
+              <div>
+                <p className="card__label">SIM Registration</p>
+                <h2>Activate Your Offline Profile</h2>
+              </div>
+              <span className="badge">Friendbot Connected</span>
+            </div>
+
+            <form className="form" onSubmit={handleActivateSIM} style={{ display: 'grid', gap: '16px' }}>
+              <label>
+                Full Name
+                <input
+                  type="text"
+                  className="vault-input"
+                  value={regName}
+                  onChange={(e) => setRegName(e.target.value)}
+                  placeholder="e.g. John Doe"
+                  required
+                />
+              </label>
+
+              <label>
+                Phone Number (GSM SIM Identity)
+                <input
+                  type="text"
+                  className="vault-input"
+                  value={regPhone}
+                  onChange={(e) => setRegPhone(e.target.value)}
+                  placeholder="e.g. +254712345678"
+                  required
+                />
+              </label>
+
+              <label>
+                4-Digit Secure Wallet PIN
+                <input
+                  type="password"
+                  className="vault-input"
+                  value={regPin}
+                  onChange={(e) => setRegPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
+                  placeholder="e.g. 1234"
+                  maxLength={4}
+                  required
+                />
+              </label>
+
+              {/* Dynamic Derivation Preview */}
+              {activeAddress && (
+                <div className="info-block" style={{ marginTop: '10px' }}>
+                  <span className="info-block__label">🔍 Real-time Keypair Derivation Preview</span>
+                  <p style={{ fontFamily: 'monospace', fontSize: '0.85rem', color: '#38bdf8' }}>
+                    Derived Public Address: {activeAddress}
+                  </p>
+                  <p style={{ fontSize: '0.75rem', color: '#64748b' }}>
+                    Note: Your secret keys are derived client-side via deterministic hashing and are never sent to the network.
+                  </p>
+                </div>
+              )}
+
+              {regError && <p className="inline-alert inline-alert--error">{regError}</p>}
+
+              <button className="primary-btn" type="submit" disabled={regLoading} style={{ marginTop: '8px' }}>
+                {regLoading ? 'Activating SIM & Requesting 10k Testnet XLM...' : 'Activate SIM & Open Wallet'}
+              </button>
+            </form>
+          </article>
+        </section>
+      </main>
+    );
+  }
+
+  // --- RENDER MAIN DASHBOARD ---
   return (
     <main className="shell">
       {/* Hero Section */}
       <section className="hero">
         <div className="hero__copy">
-          <p className="eyebrow">Level 1 · Offline USSD Bridge</p>
+          <p className="eyebrow">Level 1 · Active Profile</p>
           <h1>Last-Mile Stellar Payment Bridge</h1>
           <p className="lede">
-            A real-world simulation of an internet-free financial portal. Users sign payments offline 
-            on a retro feature phone using simulated SIM-card key derivation. An online Gateway wraps the 
-            request inside a **Stellar Fee-Bump sponsored transaction**, broadcasting it to the live testnet.
+            Welcome, <strong>{regName}</strong> ({regPhone}). Your simulated offline feature phone 
+            transacts on the live testnet using your deterministic address: <code>{formatAddress(activeAddress)}</code>.
           </p>
         </div>
 
@@ -478,18 +621,25 @@ export default function App() {
                         <div className={`menu-option ${menuIndex === 0 ? 'menu-option--selected' : ''}`}>1. Check Balance</div>
                         <div className={`menu-option ${menuIndex === 1 ? 'menu-option--selected' : ''}`}>2. Send XLM</div>
                         <div className={`menu-option ${menuIndex === 2 ? 'menu-option--selected' : ''}`}>3. Wallet Info</div>
-                        <div className={`menu-option ${menuIndex === 3 ? 'menu-option--selected' : ''}`}>4. Reset SIM</div>
+                        <div className={`menu-option ${menuIndex === 3 ? 'menu-option--selected' : ''}`}>4. Deactivate SIM</div>
                       </div>
                     )}
 
                     {currentScreen === 'BALANCE' && (
                       <div>
-                        <div className="menu-title">XLM Balance</div>
-                        <div style={{ margin: '10px 0', fontSize: '0.82rem' }}>
-                          {phoneBalanceLoading ? 'Querying...' : `${formatXlm(phoneBalance)} XLM`}
-                        </div>
-                        <div style={{ fontSize: '0.58rem', wordBreak: 'break-all', color: '#1e293b' }}>
-                          Add: {formatAddress(derivedAddress)}
+                        <div className="menu-title">{menuIndex === 0 ? 'XLM Balance' : 'Wallet Info'}</div>
+                        {menuIndex === 0 ? (
+                          <div style={{ margin: '10px 0', fontSize: '0.82rem' }}>
+                            {phoneBalanceLoading ? 'Querying...' : `${formatXlm(phoneBalance)} XLM`}
+                          </div>
+                        ) : (
+                          <div style={{ margin: '6px 0', fontSize: '0.68rem' }}>
+                            Owner: {regName}<br/>
+                            Phone: {regPhone}
+                          </div>
+                        )}
+                        <div style={{ fontSize: '0.55rem', wordBreak: 'break-all', color: '#1e293b' }}>
+                          Add: {formatAddress(activeAddress)}
                         </div>
                       </div>
                     )}
@@ -498,7 +648,7 @@ export default function App() {
                       <div>
                         <div className="menu-title">Send To:</div>
                         <div style={{ fontSize: '0.62rem', color: '#1e293b', marginBottom: '4px' }}>
-                          Select contact from list OR paste address below
+                          Select contact from list OR type public key below
                         </div>
                         <input
                           type="text"
@@ -678,17 +828,11 @@ export default function App() {
 
             {/* Operations controls */}
             <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-              <button className="primary-btn" onClick={triggerFriendbotFunding}>
-                ⚡ Register Phone Address (Friendbot)
+              <button className="primary-btn" onClick={() => loadPhoneBalance(activeAddress)}>
+                🔄 Refresh SIM Wallet Balance
               </button>
-              <button
-                className="ghost-btn"
-                onClick={() => {
-                  setLogs([]);
-                  addLog('Logs cleared. Relayer ready.', 'info');
-                }}
-              >
-                Clear Console Logs
+              <button className="ghost-btn" onClick={handleDeactivateSIM}>
+                🔒 Deactivate SIM Profile (Sign Out)
               </button>
             </div>
           </div>
