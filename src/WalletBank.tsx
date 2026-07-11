@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { deriveKeypairFromPhoneAndPin } from './lib/stellar';
+import { isValidPublicKey } from './lib/stellar';
 
 const STORAGE_KEY = 'stellar-sim-contacts';
 
@@ -10,24 +10,29 @@ export type ContactEntry = {
   address: string;
 };
 
-// Generate default contacts with valid deterministic public keys
-const getInitialContacts = (): ContactEntry[] => {
-  const defaults = [
-    { label: 'Mama (Family)', phone: '+254711111111', pin: '1111' },
-    { label: 'Water Agent', phone: '+254722222222', pin: '2222' },
-    { label: 'Rice Merchant', phone: '+254733333333', pin: '3333' },
-  ];
+// Static demo contacts with real well-known testnet public keys (funded by friendbot)
+const DEFAULT_CONTACTS: ContactEntry[] = [
+  {
+    id: 'def-1',
+    label: 'Mama (Family)',
+    phone: '+254711111111',
+    address: 'GDQP2KPQGKIHYJGXNUIYOMHARUARCA7DJT5FO2FFOOKY3B2WSQHG4W37',
+  },
+  {
+    id: 'def-2',
+    label: 'Water Agent',
+    phone: '+254722222222',
+    address: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+  },
+  {
+    id: 'def-3',
+    label: 'Rice Merchant',
+    phone: '+254733333333',
+    address: 'GBVVJJHNBLUMYE5IV76J5WHUC2418OH64IL4ZZBA5F7HPHKZS6IALVR4',
+  },
+];
 
-  return defaults.map((item, idx) => {
-    const keypair = deriveKeypairFromPhoneAndPin(item.phone, item.pin);
-    return {
-      id: `def-${idx}`,
-      label: item.label,
-      phone: item.phone,
-      address: keypair.publicKey(),
-    };
-  });
-};
+const getInitialContacts = (): ContactEntry[] => DEFAULT_CONTACTS;
 
 type Props = {
   onSelect: (contact: ContactEntry) => void;
@@ -56,7 +61,6 @@ export default function WalletBank({ onSelect }: Props) {
     }
   }, []);
 
-  // Save contacts
   const saveContacts = (updated: ContactEntry[]) => {
     setContacts(updated);
     localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
@@ -64,7 +68,7 @@ export default function WalletBank({ onSelect }: Props) {
 
   const flash = (msg: string) => {
     setFeedback(msg);
-    setTimeout(() => setFeedback(''), 2200);
+    setTimeout(() => setFeedback(''), 2500);
   };
 
   const handleSave = () => {
@@ -72,9 +76,7 @@ export default function WalletBank({ onSelect }: Props) {
       flash('Please fill in all fields.');
       return;
     }
-
-    // Basic Stellar Address validation
-    if (!addressInput.startsWith('G') || addressInput.length !== 56) {
+    if (!isValidPublicKey(addressInput.trim())) {
       flash('Enter a valid 56-character Stellar public key starting with G.');
       return;
     }
@@ -91,12 +93,11 @@ export default function WalletBank({ onSelect }: Props) {
     setNameInput('');
     setPhoneInput('');
     setAddressInput('');
-    flash('Contact saved to SIM memory.');
+    flash('✅ Contact saved to SIM memory.');
   };
 
   const handleDelete = (id: string) => {
-    const updated = contacts.filter((c) => c.id !== id);
-    saveContacts(updated);
+    saveContacts(contacts.filter((c) => c.id !== id));
     flash('Contact deleted.');
   };
 
@@ -131,7 +132,7 @@ export default function WalletBank({ onSelect }: Props) {
               value={phoneInput}
               onChange={(e) => setPhoneInput(e.target.value)}
               placeholder="Phone (e.g., +254700000000)"
-              maxLength={15}
+              maxLength={16}
               autoComplete="off"
             />
           </div>
@@ -141,7 +142,7 @@ export default function WalletBank({ onSelect }: Props) {
               type="text"
               value={addressInput}
               onChange={(e) => setAddressInput(e.target.value)}
-              placeholder="Stellar Public Key (starts with G...)"
+              placeholder="Stellar Public Key (G…)"
               autoComplete="off"
             />
             <button className="primary-btn primary-btn--small" type="button" onClick={handleSave}>
@@ -152,7 +153,6 @@ export default function WalletBank({ onSelect }: Props) {
 
         {feedback && <p className="vault-feedback">{feedback}</p>}
 
-        {/* -- Contacts list -- */}
         {contacts.length === 0 ? (
           <p className="vault-empty">No contacts on this SIM yet.</p>
         ) : (
@@ -162,7 +162,7 @@ export default function WalletBank({ onSelect }: Props) {
                 <div
                   className="vault-entry__info"
                   onClick={() => onSelect(contact)}
-                  title="Click to load into mobile phone"
+                  title="Click to load into phone dialer"
                 >
                   <span className="vault-entry__label" style={{ fontWeight: 'bold' }}>
                     👤 {contact.label}

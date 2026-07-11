@@ -1,29 +1,27 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import * as freighterApi from '@stellar/freighter-api';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import WalletBank, { ContactEntry } from './WalletBank';
 import {
-  deriveKeypairFromPhoneAndPin,
-  fundWithFriendbot,
-  getNativeBalanceFromAccount,
-  getErrorMessage,
-  submitSponsoredTransaction,
-  TESTNET_HORIZON_URL,
-  TESTNET_NETWORK_PASSPHRASE,
+  buildPaymentXdr,
+  fetchBalance,
+  fetchRecentTransactions,
   formatAddress,
   formatXlm,
+  fundWithFriendbot,
+  getErrorMessage,
+  isValidPublicKey,
+  submitFeeBumped,
+  TESTNET_HORIZON_URL,
+  TESTNET_NETWORK_PASSPHRASE,
 } from './lib/stellar';
 
+// ─── Types ──────────────────────────────────────────────────────────────────
+
 type ScreenState =
-  | 'IDLE'
-  | 'DIALING'
-  | 'MENU'
-  | 'BALANCE'
-  | 'SEND_DEST'
-  | 'SEND_AMOUNT'
-  | 'CONFIRM_PIN'
-  | 'TRANSMITTING'
-  | 'SUCCESS'
-  | 'ERROR';
+  | 'IDLE' | 'DIALING' | 'MENU' | 'BALANCE' | 'TXHISTORY'
+  | 'SEND_DEST' | 'SEND_AMOUNT' | 'CONFIRM_PIN' | 'TRANSMITTING'
+  | 'SUCCESS' | 'ERROR';
 
 type LogEntry = {
   id: string;
@@ -36,763 +34,669 @@ type UserProfile = {
   name: string;
   phone: string;
   pin: string;
-  address: string;
+  walletAddress: string;
 };
 
+type PaymentRecord = {
+  id: string;
+  type: string;
+  from: string;
+  to: string;
+  amount: string;
+  asset: string;
+  createdAt: string;
+};
+
+const freighter = freighterApi as any;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function loadProfile(): UserProfile | null {
+  try {
+    const raw = localStorage.getItem('stellar-sim-profile-v2');
+    if (raw) return JSON.parse(raw);
+  } catch { /**/ }
+  return null;
+}
+
+function saveProfile(p: UserProfile) {
+  localStorage.setItem('stellar-sim-profile-v2', JSON.stringify(p));
+}
+
+function clearProfile() {
+  localStorage.removeItem('stellar-sim-profile-v2');
+}
+
+function getSponsorKeypair(): StellarSdk.Keypair {
+  let secret = localStorage.getItem('stellar-ussd-sponsor-v2');
+  if (secret) {
+    try { return StellarSdk.Keypair.fromSecret(secret); } catch { /**/ }
+  }
+  const kp = StellarSdk.Keypair.random();
+  localStorage.setItem('stellar-ussd-sponsor-v2', kp.secret());
+  return kp;
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+
 export default function App() {
-  // --- User Profile & Registration States ---
-  const [isRegistered, setIsRegistered] = useState(false);
-  const [regName, setRegName] = useState('');
-  const [regPhone, setRegPhone] = useState('+254712345678');
-  const [regPin, setRegPin] = useState('1234');
+
+  // --- Registration ---
+  const existingProfile = loadProfile();
+  const [isRegistered, setIsRegistered] = useState<boolean>(!!existingProfile);
+  const [regName, setRegName] = useState(existingProfile?.name ?? '');
+  const [regPhone, setRegPhone] = useState(existingProfile?.phone ?? '+254712345678');
+  const [regPin, setRegPin] = useState(existingProfile?.pin ?? '');
+  const [regWalletAddr, setRegWalletAddr] = useState(existingProfile?.walletAddress ?? '');
   const [regLoading, setRegLoading] = useState(false);
   const [regError, setRegError] = useState<string | null>(null);
 
-  // --- Relayer / Sponsor States ---
-  const [sponsorKeypair, setSponsorKeypair] = useState<StellarSdk.Keypair | null>(null);
-  const [sponsorBalance, setSponsorBalance] = useState('0');
-  const [sponsorLoading, setSponsorLoading] = useState(false);
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const consoleEndRef = useRef<HTMLDivElement>(null);
+  // --- Freighter Wallet ---
+  const [freighterConnected, setFreighterConnected] = useState(false);
+  const [freighterAddress, setFreighterAddress] = useState('');
+  const [freighterLoading, setFreighterLoading] = useState(false);
 
-  // --- Simulated Phone States ---
-  const [currentScreen, setCurrentScreen] = useState<ScreenState>('IDLE');
+  // --- Sponsor (gateway that pays fees) ---
+  const [sponsorKp] = useState<StellarSdk.Keypair>(getSponsorKeypair);
+  const [sponsorBalance, setSponsorBalance] = useState('0');
+  const [sponsorReady, setSponsorReady] = useState(false);
+
+  // --- Wallet Balance (real-time) ---
+  const [walletBalance, setWalletBalance] = useState('0');
+  const [balanceLoading, setBalanceLoading] = useState(false);
+  const [lastBalanceAt, setLastBalanceAt] = useState<Date | null>(null);
+  const balancePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // --- Transaction History ---
+  const [txHistory, setTxHistory] = useState<PaymentRecord[]>([]);
+  const [txHistoryLoading, setTxHistoryLoading] = useState(false);
+
+  // --- Phone Simulator ---
+  const [screen, setScreen] = useState<ScreenState>('IDLE');
   const [dialString, setDialString] = useState('');
   const [menuIndex, setMenuIndex] = useState(0);
-  
-  // Transaction flow inputs on phone
-  const [phoneInput, setPhoneInput] = useState('');
-  const [targetDest, setTargetDest] = useState('');
-  const [targetName, setTargetName] = useState('');
-  const [targetAmount, setTargetAmount] = useState('');
-  const [phoneBalance, setPhoneBalance] = useState('0');
-  const [phoneBalanceLoading, setPhoneBalanceLoading] = useState(false);
-
+  const [destInput, setDestInput] = useState('');
+  const [destName, setDestName] = useState('');
+  const [amountInput, setAmountInput] = useState('');
+  const [pinInput, setPinInput] = useState('');
   const [lastTxHash, setLastTxHash] = useState('');
   const [lastError, setLastError] = useState('');
 
-  // Auto-scroll logs
-  useEffect(() => {
-    consoleEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
+  // --- Logs ---
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const consoleEnd = useRef<HTMLDivElement>(null);
 
-  // Add Log Helper
-  const addLog = (text: string, type: 'info' | 'success' | 'warning' | 'error' | 'packet' = 'info') => {
+  // ── Scroll log to bottom ──
+  useEffect(() => { consoleEnd.current?.scrollIntoView({ behavior: 'smooth' }); }, [logs]);
+
+  const addLog = useCallback((text: string, type: LogEntry['type'] = 'info') => {
     const time = new Date().toLocaleTimeString();
-    setLogs((prev) => [...prev, { id: `${Date.now()}-${Math.random()}`, text, type, time }]);
-  };
-
-  // --- Load Profile & Sponsor on mount ---
-  useEffect(() => {
-    const loadProfileAndSponsor = async () => {
-      // 1. Check existing user profile
-      const storedProfile = localStorage.getItem('stellar-user-profile');
-      if (storedProfile) {
-        try {
-          const profile = JSON.parse(storedProfile) as UserProfile;
-          setRegName(profile.name);
-          setRegPhone(profile.phone);
-          setRegPin(profile.pin);
-          setIsRegistered(true);
-          addLog(`Restored active SIM profile: ${profile.name} (${profile.phone})`, 'info');
-        } catch {
-          localStorage.removeItem('stellar-user-profile');
-        }
-      }
-
-      // 2. Initialize Sponsor Keypair
-      setSponsorLoading(true);
-      addLog('Initializing Gateway USSD Relayer...', 'info');
-
-      let secret = localStorage.getItem('stellar-ussd-sponsor');
-      let keypair: StellarSdk.Keypair;
-
-      if (secret) {
-        try {
-          keypair = StellarSdk.Keypair.fromSecret(secret);
-        } catch {
-          keypair = StellarSdk.Keypair.random();
-          localStorage.setItem('stellar-ussd-sponsor', keypair.secret());
-        }
-      } else {
-        keypair = StellarSdk.Keypair.random();
-        localStorage.setItem('stellar-ussd-sponsor', keypair.secret());
-      }
-
-      setSponsorKeypair(keypair);
-      addLog(`Sponsor Account Key: ${formatAddress(keypair.publicKey())}`, 'info');
-
-      const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
-      try {
-        const account = await server.loadAccount(keypair.publicKey());
-        const bal = getNativeBalanceFromAccount(account);
-        setSponsorBalance(bal);
-        addLog(`Sponsor funded. Balance: ${formatXlm(bal)} XLM`, 'success');
-      } catch {
-        addLog('Sponsor account not found. Requesting testnet XLM from Friendbot...', 'warning');
-        const funded = await fundWithFriendbot(keypair.publicKey());
-        if (funded) {
-          try {
-            const account = await server.loadAccount(keypair.publicKey());
-            const bal = getNativeBalanceFromAccount(account);
-            setSponsorBalance(bal);
-            addLog(`Sponsor funded successfully! Balance: ${formatXlm(bal)} XLM`, 'success');
-          } catch (e) {
-            addLog(`Failed to verify sponsor balance: ${getErrorMessage(e)}`, 'error');
-          }
-        } else {
-          addLog('Friendbot failed to fund Sponsor. Please refresh or try again.', 'error');
-        }
-      }
-      setSponsorLoading(false);
-    };
-
-    void loadProfileAndSponsor();
+    setLogs(p => [...p, { id: `${Date.now()}-${Math.random()}`, text, type, time }]);
   }, []);
 
-  // Compute active derived address based on profile details
-  const activeKeypair = (regPhone && regPin.length === 4)
-    ? deriveKeypairFromPhoneAndPin(regPhone, regPin)
-    : null;
-  const activeAddress = activeKeypair ? activeKeypair.publicKey() : '';
+  // ── Active wallet address (prefer Freighter, fallback to registered address) ──
+  const activeAddress = freighterConnected ? freighterAddress : (existingProfile?.walletAddress ?? regWalletAddr);
 
-  // Load Phone balance
-  const loadPhoneBalance = async (address: string) => {
+  // ── Boot: Initialize sponsor account ──
+  useEffect(() => {
+    const init = async () => {
+      addLog('Gateway Relayer initializing…', 'info');
+      addLog(`Sponsor key: ${formatAddress(sponsorKp.publicKey())}`, 'info');
+      const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+      try {
+        const acct = await server.loadAccount(sponsorKp.publicKey());
+        const bal = acct.balances.find((b: any) => b.asset_type === 'native')?.balance ?? '0';
+        setSponsorBalance(bal);
+        setSponsorReady(true);
+        addLog(`Sponsor ready. Balance: ${formatXlm(bal)} XLM`, 'success');
+      } catch {
+        addLog('Sponsor account not found — calling Friendbot…', 'warning');
+        const ok = await fundWithFriendbot(sponsorKp.publicKey());
+        if (ok) {
+          try {
+            const acct = await server.loadAccount(sponsorKp.publicKey());
+            const bal = acct.balances.find((b: any) => b.asset_type === 'native')?.balance ?? '0';
+            setSponsorBalance(bal);
+            setSponsorReady(true);
+            addLog(`Sponsor funded! Balance: ${formatXlm(bal)} XLM`, 'success');
+          } catch (e) { addLog(`Sponsor balance check failed: ${getErrorMessage(e)}`, 'error'); }
+        } else { addLog('Friendbot failed. Refresh to retry.', 'error'); }
+      }
+    };
+    void init();
+  }, []);
+
+  // ── Balance: poll every 15 seconds whenever we have an address ──
+  const refreshBalance = useCallback(async (address: string) => {
     if (!address) return;
-    setPhoneBalanceLoading(true);
-    const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+    setBalanceLoading(true);
     try {
-      const account = await server.loadAccount(address);
-      const bal = getNativeBalanceFromAccount(account);
-      setPhoneBalance(bal);
+      const bal = await fetchBalance(address);
+      setWalletBalance(bal);
+      setLastBalanceAt(new Date());
     } catch {
-      setPhoneBalance('0'); // Unactivated
-    } finally {
-      setPhoneBalanceLoading(false);
-    }
-  };
+      setWalletBalance('0');
+    } finally { setBalanceLoading(false); }
+  }, []);
 
   useEffect(() => {
-    if (isRegistered && activeAddress) {
-      void loadPhoneBalance(activeAddress);
-    }
+    if (!isRegistered || !activeAddress) return;
+    void refreshBalance(activeAddress);
+    balancePollRef.current = setInterval(() => void refreshBalance(activeAddress), 15_000);
+    return () => { if (balancePollRef.current) clearInterval(balancePollRef.current); };
   }, [isRegistered, activeAddress]);
 
-  // --- Registration / Activation Handler ---
-  const handleActivateSIM = async (e: React.FormEvent) => {
+  // ── Tx History ──
+  const loadTxHistory = useCallback(async (address: string) => {
+    if (!address) return;
+    setTxHistoryLoading(true);
+    try {
+      const records = await fetchRecentTransactions(address);
+      const mapped: PaymentRecord[] = records.map((r: any) => ({
+        id: r.id,
+        type: r.type,
+        from: r.from ?? r.source_account ?? '',
+        to: r.to ?? r.into ?? '',
+        amount: r.amount ?? r.starting_balance ?? '?',
+        asset: r.asset_type === 'native' ? 'XLM' : `${r.asset_code ?? '?'}`,
+        createdAt: r.created_at,
+      }));
+      setTxHistory(mapped);
+    } catch { setTxHistory([]); } finally { setTxHistoryLoading(false); }
+  }, []);
+
+  useEffect(() => {
+    if (isRegistered && activeAddress) void loadTxHistory(activeAddress);
+  }, [isRegistered, activeAddress]);
+
+  // ── Registration ──
+  const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!regName.trim() || !regPhone.trim() || regPin.length !== 4) {
-      setRegError('Please provide a Name, Phone Number, and 4-Digit PIN.');
-      return;
-    }
+    setRegError(null);
+    if (!regName.trim()) { setRegError('Name is required.'); return; }
+    if (!regPhone.trim()) { setRegError('Phone number is required.'); return; }
+    if (regPin.length !== 4) { setRegError('PIN must be exactly 4 digits.'); return; }
+    if (!isValidPublicKey(regWalletAddr.trim())) { setRegError('Enter a valid Stellar public key (starts with G, 56 characters).'); return; }
 
     setRegLoading(true);
-    setRegError(null);
+    addLog(`Registering SIM for ${regName} — linking ${regPhone} → ${formatAddress(regWalletAddr.trim())}`, 'info');
 
-    const keypair = deriveKeypairFromPhoneAndPin(regPhone, regPin);
-    const address = keypair.publicKey();
-
-    addLog(`Creating SIM card profile for ${regName}...`, 'info');
-    addLog(`Derived Stellar address: ${formatAddress(address)}`, 'info');
-
-    // Check if account already exists to avoid Friendbot 400 error
+    // Check if address is active on chain
     const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
-    let accountExists = false;
     try {
-      await server.loadAccount(address);
-      accountExists = true;
-      addLog('SIM address is already active on-chain.', 'info');
+      await server.loadAccount(regWalletAddr.trim());
+      addLog('Wallet address found on testnet!', 'success');
     } catch {
-      // 404 is normal for unactivated accounts
+      addLog('Address not found on testnet. Requesting Friendbot activation…', 'warning');
+      const ok = await fundWithFriendbot(regWalletAddr.trim());
+      if (!ok) {
+        setRegError('Could not activate this address on testnet. Make sure it is a valid Stellar testnet key.');
+        setRegLoading(false);
+        return;
+      }
+      addLog('Friendbot funded wallet successfully!', 'success');
     }
 
-    let success = true;
-    if (!accountExists) {
-      addLog('SIM is inactive. Requesting testnet XLM activation via Friendbot...', 'warning');
-      success = await fundWithFriendbot(address);
-    }
-
-    if (success) {
-      const profile: UserProfile = {
-        name: regName.trim(),
-        phone: regPhone.trim(),
-        pin: regPin,
-        address,
-      };
-
-      localStorage.setItem('stellar-user-profile', JSON.stringify(profile));
-      setIsRegistered(true);
-      addLog(`SIM Profile activated successfully!${accountExists ? '' : ' Wallet funded.'}`, 'success');
-      void loadPhoneBalance(address);
-    } else {
-      setRegError('SIM activation failed. Friendbot could not fund the address. Please try again.');
-      addLog('On-chain SIM activation failed.', 'error');
-    }
+    const profile: UserProfile = {
+      name: regName.trim(),
+      phone: regPhone.trim(),
+      pin: regPin,
+      walletAddress: regWalletAddr.trim(),
+    };
+    saveProfile(profile);
+    setIsRegistered(true);
+    addLog(`SIM registered. Wallet: ${formatAddress(regWalletAddr.trim())}`, 'success');
     setRegLoading(false);
   };
 
-  // --- Deactivate / Logout SIM ---
-  const handleDeactivateSIM = () => {
-    localStorage.removeItem('stellar-user-profile');
+  // ── Connect Freighter ──
+  const connectFreighter = async () => {
+    setFreighterLoading(true);
+    try {
+      const access = await freighter.requestAccess();
+      if (access?.error) throw new Error(access.error.message ?? 'Freighter denied access.');
+      const addr = access.address;
+      setFreighterAddress(addr);
+      setFreighterConnected(true);
+      addLog(`Freighter connected: ${formatAddress(addr)}`, 'success');
+      void refreshBalance(addr);
+    } catch (e) { addLog(`Freighter error: ${getErrorMessage(e)}`, 'error'); }
+    finally { setFreighterLoading(false); }
+  };
+
+  const disconnectFreighter = () => {
+    setFreighterConnected(false);
+    setFreighterAddress('');
+    addLog('Freighter disconnected. Using registered wallet address.', 'info');
+  };
+
+  // ── Sign-out ──
+  const signOut = () => {
+    clearProfile();
     setIsRegistered(false);
-    setRegName('');
-    setRegPhone('+254712345678');
-    setRegPin('1234');
-    setPhoneBalance('0');
-    setCurrentScreen('IDLE');
-    setDialString('');
-    addLog('SIM Profile deactivated and cleared from local memory.', 'warning');
+    setRegName(''); setRegPhone('+254712345678'); setRegPin(''); setRegWalletAddr('');
+    setFreighterConnected(false); setFreighterAddress('');
+    setWalletBalance('0'); setTxHistory([]);
+    setScreen('IDLE');
+    addLog('SIM profile cleared. Redirecting to registration…', 'warning');
   };
 
-  // --- T9 Input Navigation Logic ---
-  const handleKeyPress = (key: string) => {
-    if (currentScreen === 'IDLE') {
-      if (key === '*' || (key >= '0' && key <= '9')) {
-        setDialString(key);
-        setCurrentScreen('DIALING');
+  // ── Phone key handler ──
+  const handleKey = (key: string) => {
+    if (screen === 'IDLE') {
+      if (key === '*' || (key >= '0' && key <= '9')) { setDialString(key); setScreen('DIALING'); }
+    } else if (screen === 'DIALING') {
+      if (key === 'END') { setDialString(''); setScreen('IDLE'); }
+      else if (key === 'BACK') { const n = dialString.slice(0,-1); n === '' ? setScreen('IDLE') : setDialString(n); }
+      else if (key === 'CALL') {
+        if (dialString === '*123#') { addLog(`USSD session started (${regPhone})`, 'info'); setMenuIndex(0); setScreen('MENU'); }
+        else { setLastError('Invalid code. Try *123#'); setScreen('ERROR'); }
+      } else { setDialString(d => d + key); }
+    } else if (screen === 'MENU') {
+      if (key === 'END') { setScreen('IDLE'); addLog('USSD session closed.', 'info'); }
+      else if (key === '1') { void refreshBalance(activeAddress); setMenuIndex(0); setScreen('BALANCE'); }
+      else if (key === '2') { setDestInput(''); setDestName(''); setAmountInput(''); setScreen('SEND_DEST'); }
+      else if (key === '3') { void loadTxHistory(activeAddress); setScreen('TXHISTORY'); }
+      else if (key === '4') { signOut(); }
+      else if (key === 'UP') { setMenuIndex(p => p > 0 ? p-1 : 3); }
+      else if (key === 'DOWN') { setMenuIndex(p => p < 3 ? p+1 : 0); }
+      else if (key === 'SELECT') { handleKey((menuIndex+1).toString()); }
+    } else if (screen === 'BALANCE' || screen === 'TXHISTORY') {
+      if (key === 'BACK' || key === 'END' || key === 'SELECT') setScreen('MENU');
+    } else if (screen === 'SEND_DEST') {
+      if (key === 'BACK') { setScreen('MENU'); }
+      else if (key === 'END') { setScreen('IDLE'); }
+      else if ((key === 'CALL' || key === 'SELECT') && destInput.length >= 20) {
+        setScreen('SEND_AMOUNT');
       }
-    } else if (currentScreen === 'DIALING') {
-      if (key === 'END') {
-        setDialString('');
-        setCurrentScreen('IDLE');
-      } else if (key === 'CALL') {
-        if (dialString === '*123#') {
-          addLog(`USSD Session started from phone ${regPhone} (${regName})`, 'info');
-          setCurrentScreen('MENU');
-          setMenuIndex(0);
-        } else {
-          setLastError('Invalid MMI Code');
-          setCurrentScreen('ERROR');
-        }
-      } else if (key === 'BACK') {
-        const next = dialString.slice(0, -1);
-        if (next === '') {
-          setCurrentScreen('IDLE');
-        } else {
-          setDialString(next);
-        }
-      } else {
-        setDialString((prev) => prev + key);
-      }
-    } else if (currentScreen === 'MENU') {
-      if (key === 'END') {
-        addLog('USSD Session closed by user.', 'info');
-        setCurrentScreen('IDLE');
-      } else if (key === '1') {
-        // Check Balance
-        void loadPhoneBalance(activeAddress);
-        setCurrentScreen('BALANCE');
-      } else if (key === '2') {
-        // Send Payment
-        setPhoneInput('');
-        setTargetDest('');
-        setTargetName('');
-        setCurrentScreen('SEND_DEST');
-      } else if (key === '3') {
-        // My Address info
-        setCurrentScreen('BALANCE');
-      } else if (key === '4') {
-        // Deactivate SIM
-        handleDeactivateSIM();
-      } else if (key === 'UP') {
-        setMenuIndex((prev) => (prev > 0 ? prev - 1 : 3));
-      } else if (key === 'DOWN') {
-        setMenuIndex((prev) => (prev < 3 ? prev + 1 : 0));
-      } else if (key === 'SELECT') {
-        handleKeyPress((menuIndex + 1).toString());
-      }
-    } else if (currentScreen === 'BALANCE') {
-      if (key === 'END' || key === 'BACK' || key === 'SELECT') {
-        setCurrentScreen('MENU');
-      }
-    } else if (currentScreen === 'SEND_DEST') {
-      if (key === 'END') {
-        setCurrentScreen('IDLE');
-      } else if (key === 'BACK') {
-        setCurrentScreen('MENU');
-      } else if (key === 'CALL' || key === 'SELECT') {
-        if (phoneInput.length >= 10) {
-          setTargetDest(phoneInput);
-          setPhoneInput('');
-          setCurrentScreen('SEND_AMOUNT');
-        }
-      } else if (key === '*') {
-        setPhoneInput((prev) => prev + '*');
-      } else if (key === '#') {
-        setPhoneInput((prev) => prev + '#');
-      } else if (key >= '0' && key <= '9') {
-        setPhoneInput((prev) => prev + key);
-      }
-    } else if (currentScreen === 'SEND_AMOUNT') {
-      if (key === 'END') {
-        setCurrentScreen('IDLE');
-      } else if (key === 'BACK') {
-        setPhoneInput(targetDest);
-        setCurrentScreen('SEND_DEST');
-      } else if (key === 'CALL' || key === 'SELECT') {
-        if (Number(phoneInput) > 0) {
-          setTargetAmount(phoneInput);
-          setPhoneInput('');
-          setCurrentScreen('CONFIRM_PIN');
-        }
-      } else if (key >= '0' && key <= '9') {
-        setPhoneInput((prev) => prev + key);
-      } else if (key === '*') {
-        setPhoneInput((prev) => prev + '.');
-      }
-    } else if (currentScreen === 'CONFIRM_PIN') {
-      if (key === 'END') {
-        setCurrentScreen('IDLE');
-      } else if (key === 'BACK') {
-        setPhoneInput(targetAmount);
-        setCurrentScreen('SEND_AMOUNT');
-      } else if (key === 'CALL' || key === 'SELECT') {
-        if (phoneInput === regPin) {
-          setPhoneInput('');
-          void processOfflinePayment();
-        } else {
-          setLastError('Incorrect PIN');
-          setCurrentScreen('ERROR');
-        }
-      } else if (key >= '0' && key <= '9') {
-        if (phoneInput.length < 4) {
-          setPhoneInput((prev) => prev + key);
-        }
-      }
-    } else if (currentScreen === 'SUCCESS' || currentScreen === 'ERROR') {
-      if (key === 'END' || key === 'BACK' || key === 'SELECT') {
-        setCurrentScreen('IDLE');
-      }
+    } else if (screen === 'SEND_AMOUNT') {
+      if (key === 'BACK') { setScreen('SEND_DEST'); }
+      else if (key === 'END') { setScreen('IDLE'); }
+      else if ((key === 'CALL' || key === 'SELECT') && Number(amountInput) > 0) {
+        setPinInput(''); setScreen('CONFIRM_PIN');
+      } else if (key === '*') { setAmountInput(a => a.includes('.') ? a : a + '.'); }
+      else if (key >= '0' && key <= '9') { setAmountInput(a => a + key); }
+    } else if (screen === 'CONFIRM_PIN') {
+      if (key === 'BACK') { setScreen('SEND_AMOUNT'); }
+      else if (key === 'END') { setScreen('IDLE'); }
+      else if (key === 'CALL' || key === 'SELECT') {
+        if (pinInput === regPin) { void processTransaction(); }
+        else { setLastError('Incorrect PIN. Transaction cancelled.'); setScreen('ERROR'); }
+      } else if (key >= '0' && key <= '9' && pinInput.length < 4) { setPinInput(p => p + key); }
+    } else if (screen === 'SUCCESS' || screen === 'ERROR') {
+      if (key === 'END' || key === 'BACK' || key === 'SELECT') setScreen('IDLE');
     }
   };
 
-  // --- Process USSD Relayer Action ---
-  const processOfflinePayment = async () => {
-    if (!activeKeypair) return;
-    setCurrentScreen('TRANSMITTING');
-    addLog('Offline transaction signed on SIM secure element...', 'info');
-
-    const server = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
-    let seqNum = '1';
-    let needsActivation = false;
+  // ── Real Transaction ──
+  const processTransaction = async () => {
+    setScreen('TRANSMITTING');
+    addLog(`Building payment: ${amountInput} XLM → ${formatAddress(destInput)}`, 'info');
 
     try {
-      addLog(`Gateway checking client account state for ${formatAddress(activeAddress)}...`, 'info');
-      const clientAccount = await server.loadAccount(activeAddress);
-      seqNum = clientAccount.sequenceNumber();
-    } catch {
-      needsActivation = true;
-      addLog('Client account is unactivated. Gateway will sponsor activation...', 'warning');
-    }
+      // 1. Build unsigned XDR from the source account
+      const xdr = await buildPaymentXdr(activeAddress, destInput, amountInput);
+      addLog('Transaction XDR built. Requesting Freighter signature…', 'info');
 
-    try {
-      let innerTxXdr = '';
-
-      if (needsActivation) {
-        addLog('Constructing account creation transaction...', 'info');
-        const sponsorAccount = await server.loadAccount(sponsorKeypair!.publicKey());
-        
-        const createAccountTx = new StellarSdk.TransactionBuilder(sponsorAccount, {
-          fee: StellarSdk.BASE_FEE,
-          networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
-        })
-          .addOperation(
-            StellarSdk.Operation.createAccount({
-              destination: activeAddress,
-              startingBalance: '10', // Sponsor funds 10 XLM
-            })
-          )
-          .setTimeout(30)
-          .build();
-
-        createAccountTx.sign(sponsorKeypair!);
-        addLog('Sponsor executing direct account activation...', 'info');
-        const activeRes = await server.submitTransaction(createAccountTx);
-        addLog(`Client account active in ledger: ${activeRes.ledger}. Proceeding with payment...`, 'success');
-        
-        const clientAccount = await server.loadAccount(activeAddress);
-        seqNum = clientAccount.sequenceNumber();
+      // 2. Sign with Freighter (or if not connected, inform user)
+      if (!freighterConnected) {
+        throw new Error('Freighter wallet not connected. Please connect Freighter first to sign transactions.');
       }
 
-      const dummySource = new StellarSdk.Account(activeAddress, seqNum);
-      
-      const paymentOp = StellarSdk.Operation.payment({
-        destination: targetDest,
-        asset: StellarSdk.Asset.native(),
-        amount: targetAmount,
+      const signed = await freighter.signTransaction(xdr, {
+        accountToSign: activeAddress,
+        networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
       });
 
-      const innerTx = new StellarSdk.TransactionBuilder(dummySource, {
-        fee: StellarSdk.BASE_FEE,
-        networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
-      })
-        .addOperation(paymentOp)
-        .setTimeout(120)
-        .build();
+      if (signed?.error) throw new Error(signed.error.message ?? 'Freighter signing failed.');
+      const signedXdr: string = signed?.signedTxXdr ?? signed?.signedTx ?? signed;
+      if (!signedXdr) throw new Error('Freighter returned empty signed transaction.');
 
-      innerTx.sign(activeKeypair);
-      innerTxXdr = innerTx.toXDR();
+      addLog('Transaction signed. Wrapping in Fee-Bump envelope…', 'info');
 
-      const encodedPacket = `USSD_PAYLOAD|${regPhone}|${innerTxXdr.slice(0, 80)}...`;
-      addLog(`Sending raw compressed packet over USSD (120 bytes):`, 'packet');
-      addLog(encodedPacket, 'packet');
+      // 3. Wrap in fee-bump (Gateway pays fees) and submit
+      const response: any = await submitFeeBumped(signedXdr, sponsorKp.secret());
 
-      addLog('Gateway Relayer received payload. Verifying signatures...', 'info');
-      addLog('Wrapping inner transaction inside Sponsor Fee-Bump...', 'info');
-
-      const response = await submitSponsoredTransaction(innerTx.toXDR(), sponsorKeypair!.secret());
-
-      addLog(`Transaction broadcast successfully!`, 'success');
-      addLog(`Ledger: ${response.ledger} | Hash: ${response.hash}`, 'success');
+      addLog(`✅ Broadcast successful! Ledger: ${response.ledger}`, 'success');
+      addLog(`Hash: ${response.hash}`, 'success');
       setLastTxHash(response.hash);
 
-      void loadPhoneBalance(activeAddress);
-      
-      const sponsorAcct = await server.loadAccount(sponsorKeypair!.publicKey());
-      setSponsorBalance(getNativeBalanceFromAccount(sponsorAcct));
+      // 4. Refresh balance and history
+      void refreshBalance(activeAddress);
+      void loadTxHistory(activeAddress);
 
-      setCurrentScreen('SUCCESS');
-    } catch (error) {
-      const msg = getErrorMessage(error);
+      // 5. Refresh sponsor balance
+      try {
+        const newBal = await fetchBalance(sponsorKp.publicKey());
+        setSponsorBalance(newBal);
+      } catch { /**/ }
+
+      setScreen('SUCCESS');
+    } catch (e) {
+      const msg = getErrorMessage(e);
       addLog(`Transaction failed: ${msg}`, 'error');
       setLastError(msg);
-      setCurrentScreen('ERROR');
+      setScreen('ERROR');
     }
   };
 
-  // Handle contact select
-  const handleContactSelect = (contact: ContactEntry) => {
-    addLog(`Loaded contact "${contact.label}" from SIM card memory.`, 'info');
-    setTargetName(contact.label);
-    setTargetDest(contact.address);
-    setPhoneInput(contact.address);
-    setCurrentScreen('SEND_AMOUNT');
+  // ── Contact select from SIM Book ──
+  const handleContactSelect = (c: ContactEntry) => {
+    setDestInput(c.address);
+    setDestName(c.label);
+    addLog(`Contact loaded: "${c.label}" → ${formatAddress(c.address)}`, 'info');
+    setScreen('SEND_AMOUNT');
   };
 
-  // --- RENDER REGISTRATION SCREEN ---
+  // ─────────────────────────────────────────────────────────────────────────────
+  // RENDER — Registration Screen
+  // ─────────────────────────────────────────────────────────────────────────────
   if (!isRegistered) {
     return (
       <main className="shell">
-        <section className="hero" style={{ marginBottom: '32px' }}>
-          <div className="hero__copy">
-            <p className="eyebrow">Level 1 · SIM Activation</p>
-            <h1>Last-Mile Offline Payment Bridge</h1>
-            <p className="lede">
-              Welcome to the Stellar Last-Mile prototype. To simulate an offline feature phone transacting 
-              without internet, you must first register your profile and activate your local SIM card on the 
-              Stellar Testnet.
-            </p>
-          </div>
-        </section>
-
-        <section style={{ maxWidth: '600px', margin: '0 auto' }}>
-          <article className="card">
-            <div className="card__header">
-              <div>
-                <p className="card__label">SIM Registration</p>
-                <h2>Activate Your Offline Profile</h2>
-              </div>
-              <span className="badge">Friendbot Connected</span>
+        <div className="reg-screen">
+          <div className="reg-card">
+            <div className="reg-header">
+              <div className="reg-logo">📡</div>
+              <h1>Stellar Last-Mile Bridge</h1>
+              <p>Register your SIM profile to start transacting on the Stellar Testnet without internet.</p>
             </div>
 
-            <form className="form" onSubmit={handleActivateSIM} style={{ display: 'grid', gap: '16px' }}>
-              <label>
-                Full Name
+            <form onSubmit={handleRegister}>
+              <div className="reg-field">
+                <label>Full Name</label>
                 <input
-                  type="text"
-                  className="vault-input"
-                  value={regName}
-                  onChange={(e) => setRegName(e.target.value)}
-                  placeholder="e.g. John Doe"
+                  type="text" value={regName}
+                  onChange={e => setRegName(e.target.value)}
+                  placeholder="e.g. Amara Diallo"
                   required
                 />
-              </label>
+              </div>
 
-              <label>
-                Phone Number (GSM SIM Identity)
+              <div className="reg-field">
+                <label>Phone Number <span className="reg-hint">(GSM SIM identity)</span></label>
                 <input
-                  type="text"
-                  className="vault-input"
-                  value={regPhone}
-                  onChange={(e) => setRegPhone(e.target.value)}
-                  placeholder="e.g. +254712345678"
+                  type="text" value={regPhone}
+                  onChange={e => setRegPhone(e.target.value)}
+                  placeholder="+254712345678"
                   required
                 />
-              </label>
+              </div>
 
-              <label>
-                4-Digit Secure Wallet PIN
+              <div className="reg-field">
+                <label>Stellar Wallet Address <span className="reg-hint">(Public key, starts with G)</span></label>
                 <input
-                  type="password"
-                  className="vault-input"
-                  value={regPin}
-                  onChange={(e) => setRegPin(e.target.value.replace(/\D/g, '').slice(0, 4))}
-                  placeholder="e.g. 1234"
+                  type="text" value={regWalletAddr}
+                  onChange={e => setRegWalletAddr(e.target.value)}
+                  placeholder="GXXXXXX…"
+                  required
+                  className={regWalletAddr && !isValidPublicKey(regWalletAddr) ? 'input--invalid' : regWalletAddr && isValidPublicKey(regWalletAddr) ? 'input--valid' : ''}
+                />
+                {regWalletAddr && isValidPublicKey(regWalletAddr) && (
+                  <div className="reg-derived">
+                    <span className="reg-derived__label">✅ Valid Stellar address</span>
+                    <span className="reg-derived__addr">{regWalletAddr}</span>
+                  </div>
+                )}
+                {regWalletAddr && !isValidPublicKey(regWalletAddr) && (
+                  <div className="reg-derived reg-derived--err">
+                    <span>⚠️ Invalid address format</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="reg-field">
+                <label>4-Digit Wallet PIN <span className="reg-hint">(used to confirm payments on phone)</span></label>
+                <input
+                  type="password" value={regPin}
+                  onChange={e => setRegPin(e.target.value.replace(/\D/g,'').slice(0,4))}
+                  placeholder="••••"
                   maxLength={4}
                   required
                 />
-              </label>
+              </div>
 
-              {/* Dynamic Derivation Preview */}
-              {activeAddress && (
-                <div className="info-block" style={{ marginTop: '10px' }}>
-                  <span className="info-block__label">🔍 Real-time Keypair Derivation Preview</span>
-                  <p style={{ fontFamily: 'monospace', fontSize: '0.85rem', color: '#38bdf8' }}>
-                    Derived Public Address: {activeAddress}
-                  </p>
-                  <p style={{ fontSize: '0.75rem', color: '#64748b' }}>
-                    Note: Your secret keys are derived client-side via deterministic hashing and are never sent to the network.
-                  </p>
-                </div>
-              )}
+              {regError && <div className="reg-error">⚠ {regError}</div>}
 
-              {regError && <p className="inline-alert inline-alert--error">{regError}</p>}
-
-              <button className="primary-btn" type="submit" disabled={regLoading} style={{ marginTop: '8px' }}>
-                {regLoading ? 'Activating SIM & Requesting 10k Testnet XLM...' : 'Activate SIM & Open Wallet'}
+              <button className="reg-submit" type="submit" disabled={regLoading}>
+                {regLoading ? 'Activating SIM on Stellar Testnet…' : '🚀 Activate SIM & Start Transacting'}
               </button>
             </form>
-          </article>
-        </section>
+
+            <div className="reg-info">
+              <div>📡 Your wallet address is linked to your phone number.</div>
+              <div>🔐 Your PIN is stored locally and never transmitted.</div>
+              <div>⚡ Transactions are sponsored — you pay 0 XLM in fees.</div>
+            </div>
+          </div>
+        </div>
       </main>
     );
   }
 
-  // --- RENDER MAIN DASHBOARD ---
+  // ─────────────────────────────────────────────────────────────────────────────
+  // RENDER — Main Dashboard
+  // ─────────────────────────────────────────────────────────────────────────────
+  const profile = loadProfile()!;
+
   return (
     <main className="shell">
-      {/* Hero Section */}
+      {/* ── Hero ── */}
       <section className="hero">
         <div className="hero__copy">
-          <p className="eyebrow">Level 1 · Active Profile</p>
-          <h1>Last-Mile Stellar Payment Bridge</h1>
+          <p className="eyebrow">Stellar Last-Mile · Active SIM</p>
+          <h1>Offline Payment Bridge</h1>
           <p className="lede">
-            Welcome, <strong>{regName}</strong> ({regPhone}). Your simulated offline feature phone 
-            transacts on the live testnet using your deterministic address: <code>{formatAddress(activeAddress)}</code>.
+            Welcome, <strong>{profile.name}</strong>. Your SIM card is active and linked to{' '}
+            <code>{profile.phone}</code>.<br/>
+            Dial <strong>*123#</strong> on the phone below to start transacting.
           </p>
+
+          {/* Real-time balance display */}
+          <div className="balance-hero">
+            <div className="balance-hero__label">Live Wallet Balance</div>
+            <div className="balance-hero__value">
+              {balanceLoading ? 'Fetching…' : `${formatXlm(walletBalance)} XLM`}
+            </div>
+            <div className="balance-hero__meta">
+              {lastBalanceAt ? `Last updated ${lastBalanceAt.toLocaleTimeString()} · auto-refreshes every 15s` : 'Loading…'}
+            </div>
+            <div className="balance-hero__addr">{activeAddress}</div>
+          </div>
         </div>
 
         <div className="hero__panel">
-          <span className="badge">Testnet Sandbox</span>
-          <div className="hero__panel-media">
-            <img src="/screenshots/contact us.png" alt="Concept Banner" loading="lazy" />
-          </div>
+          {/* Freighter connection */}
           <div>
-            <span className="hero__panel-title">Zero-Internet Architecture</span>
-            <p className="hero__panel-copy">
-              Showcases sponsored reserves, fee-bumps, and cryptographic signing on basic hardware 
-              to bridge the digital divide.
+            <p className="card__label">Freighter Wallet</p>
+            {freighterConnected ? (
+              <div>
+                <div className="freighter-connected">
+                  <span className="dot dot--green" />
+                  <span>{formatAddress(freighterAddress)}</span>
+                </div>
+                <button className="ghost-btn" style={{marginTop:'8px',width:'100%'}} onClick={disconnectFreighter}>
+                  Disconnect
+                </button>
+              </div>
+            ) : (
+              <button className="primary-btn" style={{width:'100%',marginTop:'6px'}} onClick={connectFreighter} disabled={freighterLoading}>
+                {freighterLoading ? 'Connecting…' : '🦊 Connect Freighter to Sign'}
+              </button>
+            )}
+            {!freighterConnected && (
+              <p className="lede" style={{fontSize:'0.72rem',marginTop:'8px',color:'#ef4444'}}>
+                ⚠ Connect Freighter to execute real transactions.
+              </p>
+            )}
+          </div>
+
+          <div className="info-block">
+            <span className="info-block__label">Active Address</span>
+            <p style={{fontSize:'0.78rem',wordBreak:'break-all',fontFamily:'monospace'}}>
+              {activeAddress || '—'}
             </p>
           </div>
+
+          <button className="ghost-btn" style={{width:'100%'}} onClick={signOut}>
+            🔒 Sign Out / Change Profile
+          </button>
         </div>
       </section>
 
-      {/* Main Grid */}
+      {/* ── Main Grid ── */}
       <section className="grid">
-        {/* Left: Phone Simulator Card */}
+
+        {/* ─ Phone Simulator ─ */}
         <article className="card card--phone">
           <div className="card__header">
             <div>
               <p className="card__label">Hardware Simulator</p>
-              <h2>Nokia 3310 Engine</h2>
+              <h2>Nokia 3310</h2>
             </div>
-            <span className={`state-pill state-pill--${currentScreen !== 'IDLE' ? 'on' : 'off'}`}>
-              {currentScreen === 'IDLE' ? 'Standby' : 'USSD Active'}
+            <span className={`state-pill state-pill--${screen !== 'IDLE' ? 'on' : 'off'}`}>
+              {screen === 'IDLE' ? 'Standby' : 'USSD Active'}
             </span>
           </div>
 
           <div className="phone-container">
             <div className="phone-mockup">
               <div className="phone-earpiece" />
-              
-              {/* LCD Display */}
+
+              {/* LCD */}
               <div className="phone-screen-frame">
                 <div className="phone-screen">
-                  {/* Screen Header */}
                   <div className="screen-header">
                     <span>📶 Safaricom</span>
-                    <span>🔋 100%</span>
+                    <span>🔋</span>
                   </div>
-
-                  {/* Screen Body */}
                   <div className="screen-body">
-                    {currentScreen === 'IDLE' && (
-                      <div style={{ textAlign: 'center', marginTop: '24px' }}>
-                        <div style={{ fontSize: '1.2rem', letterSpacing: '0.05em' }}>Stellar SIM</div>
-                        <div style={{ fontSize: '0.68rem', color: '#334155', marginTop: '16px' }}>Dial *123# to start</div>
+                    {screen === 'IDLE' && (
+                      <div className="screen-idle">
+                        <div className="screen-name">{profile.name.split(' ')[0]}'s SIM</div>
+                        <div className="screen-hint">Dial *123# ▶ Call</div>
                       </div>
                     )}
-
-                    {currentScreen === 'DIALING' && (
-                      <div style={{ marginTop: '20px', wordBreak: 'break-all' }}>
-                        <span style={{ fontSize: '1.1rem' }}>{dialString}</span>
+                    {screen === 'DIALING' && (
+                      <div className="screen-dial">
+                        <span>{dialString}</span>
                         <span className="lcd-cursor" />
                       </div>
                     )}
-
-                    {currentScreen === 'MENU' && (
+                    {screen === 'MENU' && (
                       <div>
                         <div className="menu-title">Stellar USSD</div>
-                        <div className={`menu-option ${menuIndex === 0 ? 'menu-option--selected' : ''}`}>1. Check Balance</div>
-                        <div className={`menu-option ${menuIndex === 1 ? 'menu-option--selected' : ''}`}>2. Send XLM</div>
-                        <div className={`menu-option ${menuIndex === 2 ? 'menu-option--selected' : ''}`}>3. Wallet Info</div>
-                        <div className={`menu-option ${menuIndex === 3 ? 'menu-option--selected' : ''}`}>4. Deactivate SIM</div>
+                        {['1. Check Balance','2. Send XLM','3. Tx History','4. Sign Out'].map((opt, i) => (
+                          <div key={i} className={`menu-option ${menuIndex === i ? 'menu-option--selected' : ''}`}>{opt}</div>
+                        ))}
                       </div>
                     )}
-
-                    {currentScreen === 'BALANCE' && (
+                    {screen === 'BALANCE' && (
                       <div>
-                        <div className="menu-title">{menuIndex === 0 ? 'XLM Balance' : 'Wallet Info'}</div>
-                        {menuIndex === 0 ? (
-                          <div style={{ margin: '10px 0', fontSize: '0.82rem' }}>
-                            {phoneBalanceLoading ? 'Querying...' : `${formatXlm(phoneBalance)} XLM`}
-                          </div>
-                        ) : (
-                          <div style={{ margin: '6px 0', fontSize: '0.68rem' }}>
-                            Owner: {regName}<br/>
-                            Phone: {regPhone}
-                          </div>
-                        )}
-                        <div style={{ fontSize: '0.55rem', wordBreak: 'break-all', color: '#1e293b' }}>
-                          Add: {formatAddress(activeAddress)}
+                        <div className="menu-title">Balance</div>
+                        <div className="screen-balance">
+                          {balanceLoading ? 'Querying…' : `${formatXlm(walletBalance)} XLM`}
                         </div>
+                        <div className="screen-subtext">{formatAddress(activeAddress)}</div>
                       </div>
                     )}
-
-                    {currentScreen === 'SEND_DEST' && (
+                    {screen === 'TXHISTORY' && (
                       <div>
-                        <div className="menu-title">Send To:</div>
-                        <div style={{ fontSize: '0.62rem', color: '#1e293b', marginBottom: '4px' }}>
-                          Select contact from list OR type public key below
-                        </div>
+                        <div className="menu-title">Recent Txs</div>
+                        {txHistoryLoading ? <div className="screen-subtext">Loading…</div>
+                          : txHistory.length === 0 ? <div className="screen-subtext">No transactions found.</div>
+                          : txHistory.slice(0, 3).map(tx => (
+                            <div key={tx.id} className="screen-tx">
+                              <span>{tx.from === activeAddress ? '↑ Sent' : '↓ Rcvd'}</span>
+                              <span>{tx.amount} {tx.asset}</span>
+                            </div>
+                          ))
+                        }
+                      </div>
+                    )}
+                    {screen === 'SEND_DEST' && (
+                      <div>
+                        <div className="menu-title">Recipient</div>
+                        <div className="screen-subtext">Select from contacts ↓ or paste below:</div>
                         <input
-                          type="text"
                           className="phone-input-line"
-                          value={phoneInput}
-                          onChange={(e) => setPhoneInput(e.target.value)}
-                          placeholder="Phone / G... address"
+                          type="text"
+                          value={destInput}
+                          onChange={e => setDestInput(e.target.value)}
+                          placeholder="G… address"
                         />
                       </div>
                     )}
-
-                    {currentScreen === 'SEND_AMOUNT' && (
+                    {screen === 'SEND_AMOUNT' && (
                       <div>
-                        <div className="menu-title">Amount (XLM):</div>
-                        <div style={{ fontSize: '0.65rem', marginBottom: '8px' }}>
-                          Dest: {targetName || formatAddress(targetDest)}
-                        </div>
+                        <div className="menu-title">Amount (XLM)</div>
+                        <div className="screen-subtext">{destName || formatAddress(destInput)}</div>
                         <input
-                          type="text"
                           className="phone-input-line"
-                          value={phoneInput}
-                          onChange={(e) => setPhoneInput(e.target.value)}
+                          type="number"
+                          value={amountInput}
+                          onChange={e => setAmountInput(e.target.value)}
                           placeholder="0.0"
+                          min="0.0000001"
+                          step="0.0000001"
                         />
                       </div>
                     )}
-
-                    {currentScreen === 'CONFIRM_PIN' && (
+                    {screen === 'CONFIRM_PIN' && (
                       <div>
-                        <div className="menu-title">Enter PIN:</div>
-                        <div style={{ fontSize: '0.65rem', marginBottom: '10px' }}>
-                          Send {targetAmount} XLM to {targetName || formatAddress(targetDest)}?
-                        </div>
-                        <div style={{ textAlign: 'center' }}>
-                          <span style={{ fontSize: '1.2rem', letterSpacing: '0.2em' }}>
-                            {'*'.repeat(phoneInput.length) || '_'}
-                          </span>
-                        </div>
+                        <div className="menu-title">Enter PIN</div>
+                        <div className="screen-subtext">Send {amountInput} XLM to {destName || formatAddress(destInput)}</div>
+                        <div className="screen-pin">{'●'.repeat(pinInput.length)}{'_'.repeat(4 - pinInput.length)}</div>
                       </div>
                     )}
-
-                    {currentScreen === 'TRANSMITTING' && (
-                      <div style={{ textAlign: 'center', marginTop: '24px' }}>
-                        <div>🛰️ USSD PACKET</div>
-                        <div style={{ fontSize: '0.68rem', marginTop: '10px', color: '#334155' }}>
-                          Transmitting packet via cell tower...
-                        </div>
+                    {screen === 'TRANSMITTING' && (
+                      <div className="screen-idle">
+                        <div>🛰 Transmitting…</div>
+                        <div className="screen-hint">Signing & broadcasting…</div>
                       </div>
                     )}
-
-                    {currentScreen === 'SUCCESS' && (
-                      <div style={{ textAlign: 'center', marginTop: '16px' }}>
-                        <div>✅ Success</div>
-                        <div style={{ fontSize: '0.68rem', marginTop: '8px' }}>
-                          Sent {targetAmount} XLM.
-                        </div>
-                        <div style={{ fontSize: '0.55rem', color: '#1e293b', marginTop: '8px' }}>
-                          Hash: {lastTxHash.slice(0, 12)}...
-                        </div>
+                    {screen === 'SUCCESS' && (
+                      <div className="screen-idle">
+                        <div>✅ Sent!</div>
+                        <div className="screen-hint">{amountInput} XLM</div>
+                        <div className="screen-subtext" style={{fontSize:'0.5rem'}}>{lastTxHash.slice(0,16)}…</div>
                       </div>
                     )}
-
-                    {currentScreen === 'ERROR' && (
-                      <div style={{ marginTop: '8px' }}>
-                        <div style={{ color: '#7f1d1d' }}>⚠️ Error</div>
-                        <div style={{ fontSize: '0.6rem', marginTop: '4px', overflowY: 'auto', maxHeight: '110px' }}>
-                          {lastError}
-                        </div>
+                    {screen === 'ERROR' && (
+                      <div>
+                        <div style={{color:'#7f1d1d',fontWeight:'bold'}}>⚠ Error</div>
+                        <div className="screen-subtext" style={{maxHeight:'90px',overflowY:'auto',fontSize:'0.56rem'}}>{lastError}</div>
                       </div>
                     )}
                   </div>
-
-                  {/* Screen Footer */}
                   <div className="screen-footer">
-                    <span>
-                      {currentScreen === 'MENU' || currentScreen === 'SEND_DEST' || currentScreen === 'SEND_AMOUNT' || currentScreen === 'CONFIRM_PIN' ? 'Back' : ''}
-                    </span>
-                    <span>
-                      {currentScreen === 'IDLE' ? 'Dial' : currentScreen === 'MENU' ? 'Select' : 'OK'}
-                    </span>
+                    <span>{['MENU','SEND_DEST','SEND_AMOUNT','CONFIRM_PIN'].includes(screen) ? 'Back' : ''}</span>
+                    <span>{screen === 'IDLE' ? 'Dial' : 'OK'}</span>
                   </div>
                 </div>
               </div>
 
-              {/* Navigation softkeys */}
+              {/* Softkeys */}
               <div className="phone-softkeys">
-                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('BACK')}>
-                  ⬅ Back
-                </button>
-                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('UP')}>
-                  ▲ Up
-                </button>
-                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('SELECT')}>
-                  OK
-                </button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKey('BACK')}>⬅ Back</button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKey('UP')}>▲</button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKey('SELECT')}>OK</button>
               </div>
-
-              {/* Main Call/End Row */}
-              <div className="phone-softkeys" style={{ marginTop: '8px' }}>
-                <button className="phone-btn phone-btn--call" onClick={() => handleKeyPress('CALL')}>
-                  📞 Call
-                </button>
-                <button className="phone-btn phone-btn--soft" onClick={() => handleKeyPress('DOWN')}>
-                  ▼ Down
-                </button>
-                <button className="phone-btn phone-btn--end" onClick={() => handleKeyPress('END')}>
-                  ❌ End
-                </button>
+              <div className="phone-softkeys" style={{marginTop:'8px'}}>
+                <button className="phone-btn phone-btn--call" onClick={() => handleKey('CALL')}>📞</button>
+                <button className="phone-btn phone-btn--soft" onClick={() => handleKey('DOWN')}>▼</button>
+                <button className="phone-btn phone-btn--end" onClick={() => handleKey('END')}>❌</button>
               </div>
-
-              {/* Numeric Keypad */}
               <div className="phone-keypad">
                 {[
-                  { num: '1', let: 'o_o' },
-                  { num: '2', let: 'abc' },
-                  { num: '3', let: 'def' },
-                  { num: '4', let: 'ghi' },
-                  { num: '5', let: 'jkl' },
-                  { num: '6', let: 'mno' },
-                  { num: '7', let: 'pqrs' },
-                  { num: '8', let: 'tuv' },
-                  { num: '9', let: 'wxyz' },
-                  { num: '*', let: '.' },
-                  { num: '0', let: 'space' },
-                  { num: '#', let: 'caps' },
-                ].map((k) => (
-                  <button key={k.num} className="phone-btn" onClick={() => handleKeyPress(k.num)}>
-                    <span className="phone-btn__num">{k.num}</span>
-                    <span className="phone-btn__letters">{k.let}</span>
+                  ['1','o_o'],['2','abc'],['3','def'],
+                  ['4','ghi'],['5','jkl'],['6','mno'],
+                  ['7','pqrs'],['8','tuv'],['9','wxyz'],
+                  ['*','.'],['0','sp'],['#','#'],
+                ].map(([n, l]) => (
+                  <button key={n} className="phone-btn" onClick={() => handleKey(n)}>
+                    <span className="phone-btn__num">{n}</span>
+                    <span className="phone-btn__letters">{l}</span>
                   </button>
                 ))}
               </div>
@@ -800,103 +704,120 @@ export default function App() {
           </div>
         </article>
 
-        {/* Right: Gateway / Relayer Console Card */}
+        {/* ─ Gateway Console ─ */}
         <article className="card card--gateway">
           <div className="card__header">
             <div>
               <p className="card__label">Cellular Relayer Gateway</p>
-              <h2>Stellar Broadcast Console</h2>
+              <h2>Broadcast Console</h2>
             </div>
-            <span className="state-pill state-pill--accent">Sponsor Fee Pay Enabled</span>
+            <span className="state-pill state-pill--accent">Fee-Bump Active</span>
           </div>
 
           <div className="gateway-console">
-            {/* Info grid */}
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '14px' }}>
+            {/* Sponsor & user info */}
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:'12px'}}>
               <div className="info-block">
-                <span className="info-block__label">Sponsor Address</span>
-                <p style={{ fontFamily: 'monospace', fontSize: '0.8rem' }}>
-                  {sponsorKeypair ? formatAddress(sponsorKeypair.publicKey()) : 'Loading...'}
-                </p>
+                <span className="info-block__label">Gateway Sponsor</span>
+                <p style={{fontFamily:'monospace',fontSize:'0.75rem'}}>{formatAddress(sponsorKp.publicKey())}</p>
+                <p style={{fontWeight:'bold',marginTop:'4px'}}>{formatXlm(sponsorBalance)} XLM</p>
               </div>
               <div className="info-block">
-                <span className="info-block__label">Sponsor Balance</span>
-                <p style={{ fontWeight: 'bold' }}>
-                  {sponsorLoading ? 'Fetching...' : `${formatXlm(sponsorBalance)} XLM`}
+                <span className="info-block__label">Your Wallet (Live)</span>
+                <p style={{fontFamily:'monospace',fontSize:'0.75rem'}}>{formatAddress(activeAddress)}</p>
+                <p style={{fontWeight:'bold',marginTop:'4px',color: balanceLoading ? '#94a3b8' : '#4ade80'}}>
+                  {balanceLoading ? 'Refreshing…' : `${formatXlm(walletBalance)} XLM`}
                 </p>
               </div>
             </div>
 
-            {/* Terminal Monitor */}
+            {/* Console log */}
             <div className="console-monitor">
-              {logs.length === 0 ? (
-                <p className="console-line console-line--info">Waiting for incoming USSD connection...</p>
-              ) : (
-                logs.map((log) => (
-                  <p key={log.id} className={`console-line console-line--${log.type}`}>
-                    [{log.time}] {log.text}
+              {logs.length === 0
+                ? <p className="console-line console-line--info">Waiting for USSD connection…</p>
+                : logs.map(l => (
+                  <p key={l.id} className={`console-line console-line--${l.type}`}>
+                    [{l.time}] {l.text}
                   </p>
                 ))
-              )}
-              <div ref={consoleEndRef} />
+              }
+              <div ref={consoleEnd} />
             </div>
 
-            {/* Operations controls */}
-            <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-              <button className="primary-btn" onClick={() => loadPhoneBalance(activeAddress)}>
-                🔄 Refresh SIM Wallet Balance
+            {/* Last tx hash */}
+            {lastTxHash && (
+              <div className="info-block">
+                <span className="info-block__label">Last Transaction Hash</span>
+                <p style={{fontFamily:'monospace',fontSize:'0.75rem',wordBreak:'break-all'}}>{lastTxHash}</p>
+                <a
+                  href={`https://stellar.expert/explorer/testnet/tx/${lastTxHash}`}
+                  target="_blank" rel="noreferrer"
+                  className="primary-btn"
+                  style={{display:'inline-flex',marginTop:'8px',textDecoration:'none',padding:'8px 14px',fontSize:'0.82rem'}}
+                >
+                  🔍 View on Stellar.Expert
+                </a>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div style={{display:'flex',gap:'10px',flexWrap:'wrap'}}>
+              <button className="primary-btn" onClick={() => { void refreshBalance(activeAddress); void loadTxHistory(activeAddress); addLog('Manual refresh triggered.','info'); }}>
+                🔄 Refresh Now
               </button>
-              <button className="ghost-btn" onClick={handleDeactivateSIM}>
-                🔒 Deactivate SIM Profile (Sign Out)
+              <button className="ghost-btn" onClick={() => { setLogs([]); addLog('Console cleared.','info'); }}>
+                Clear Console
               </button>
             </div>
           </div>
         </article>
 
-        {/* Left Bottom: SIM Contacts */}
+        {/* ─ SIM Contacts ─ */}
         <WalletBank onSelect={handleContactSelect} />
 
-        {/* Right Bottom: Tech/Education Specs */}
+        {/* ─ Tx History ─ */}
         <article className="card card--education">
           <div className="card__header">
             <div>
-              <p className="card__label">Protocol Documentation</p>
-              <h2>How Offline Bridge Works</h2>
+              <p className="card__label">Stellar Testnet</p>
+              <h2>Transaction History</h2>
             </div>
-            <span className="state-pill state-pill--neutral">Level 1 Architecture</span>
+            <button className="ghost-btn" style={{padding:'6px 12px',fontSize:'0.78rem'}} onClick={() => void loadTxHistory(activeAddress)}>
+              Refresh
+            </button>
           </div>
-
-          <div className="edu-grid">
-            <div className="edu-item">
-              <h4>1. Sim-based Key Derivation</h4>
-              <p>
-                Instead of storing secret keys online, the simulated phone derives a private/public keypair deterministically 
-                from the <strong>Phone Number</strong> and a <strong>4-digit PIN</strong>. This replicates standard secure elements 
-                (SIM cards) storing secrets offline.
-              </p>
-            </div>
-            <div className="edu-item">
-              <h4>2. USSD Session Dialog</h4>
-              <p>
-                Users dial <code>*123#</code> to establish a real-time GSM channel. The gateway responds with numbered text options. 
-                This requires zero internet connection or mobile data, running on basic cellular towers.
-              </p>
-            </div>
-            <div className="edu-item">
-              <h4>3. Offline Signature Packaging</h4>
-              <p>
-                Once transaction parameters are confirmed, the phone uses its offline key to sign the transaction XDR. The signature 
-                and payload are packed into a compressed format, sent back over the cellular network.
-              </p>
-            </div>
-            <div className="edu-item">
-              <h4>4. Sponsored Fee-Bumping</h4>
-              <p>
-                The Gateway Relayer intercepts the payload. To make it completely free for the unbanked user, the Gateway wraps the 
-                transaction in a <strong>Stellar Fee-Bump Transaction</strong>. The Sponsor pays the network fee, and submits it to Horizon.
-              </p>
-            </div>
-          </div>
+          {txHistoryLoading
+            ? <p style={{color:'#94a3b8',fontSize:'0.85rem'}}>Loading history from Horizon…</p>
+            : txHistory.length === 0
+              ? <p style={{color:'#64748b',fontSize:'0.85rem'}}>No recent transactions found for this address.</p>
+              : (
+                <div style={{display:'flex',flexDirection:'column',gap:'10px'}}>
+                  {txHistory.map(tx => (
+                    <div key={tx.id} className="tx-row">
+                      <div className="tx-row__icon">
+                        {tx.from === activeAddress ? '↑' : '↓'}
+                      </div>
+                      <div className="tx-row__info">
+                        <span className="tx-row__label">
+                          {tx.from === activeAddress ? 'Sent to' : 'Received from'}
+                        </span>
+                        <span className="tx-row__addr">
+                          {formatAddress(tx.from === activeAddress ? tx.to : tx.from)}
+                        </span>
+                      </div>
+                      <div className="tx-row__amount">
+                        <span className={tx.from === activeAddress ? 'amount--sent' : 'amount--recv'}>
+                          {tx.from === activeAddress ? '-' : '+'}{tx.amount} {tx.asset}
+                        </span>
+                        <span className="tx-row__time">
+                          {new Date(tx.createdAt).toLocaleTimeString()}
+                        </span>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )
+          }
         </article>
       </section>
     </main>

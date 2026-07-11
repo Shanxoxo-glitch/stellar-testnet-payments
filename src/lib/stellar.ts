@@ -3,112 +3,119 @@ import * as StellarSdk from '@stellar/stellar-sdk';
 export const TESTNET_HORIZON_URL = 'https://horizon-testnet.stellar.org';
 export const TESTNET_NETWORK_PASSPHRASE = StellarSdk.Networks.TESTNET;
 
-export function formatAddress(address: string) {
-  if (address.length <= 14) {
-    return address;
-  }
+export const horizonServer = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
 
-  return `${address.slice(0, 6)}…${address.slice(-6)}`;
+export function formatAddress(address: string): string {
+  if (!address || address.length <= 14) return address ?? '';
+  return `${address.slice(0, 8)}…${address.slice(-8)}`;
 }
 
-export function formatXlm(balance: string) {
+export function formatXlm(balance: string): string {
   const parsed = Number(balance);
-
-  if (Number.isNaN(parsed)) {
-    return balance;
-  }
-
+  if (Number.isNaN(parsed)) return balance;
   return parsed.toLocaleString('en-US', {
-    minimumFractionDigits: 0,
+    minimumFractionDigits: 2,
     maximumFractionDigits: 7,
   });
 }
 
-export function getNativeBalanceFromAccount(account: any) {
-  const nativeBalance = account.balances.find((entry: any) => entry.asset_type === 'native');
-
-  return nativeBalance?.balance ?? '0';
-}
-
-export function getErrorMessage(error: unknown) {
-  if (error instanceof Error) {
-    return error.message;
-  }
-
-  if (typeof error === 'string') {
-    return error;
-  }
-
-  return 'Something went wrong while completing the request.';
-}
-
-/**
- * Deterministically derives a Stellar keypair from a phone number and a 4-digit PIN.
- * This simulates a secure SIM card-based key vault.
- */
-export function deriveKeypairFromPhoneAndPin(phone: string, pin: string): StellarSdk.Keypair {
-  const cleanPhone = phone.replace(/\D/g, '');
-  const cleanPin = pin.replace(/\D/g, '').slice(0, 4).padEnd(4, '0');
-  const seedMaterial = `${cleanPhone}:${cleanPin}`;
-  
-  // Deterministic seed generation
-  const encoder = new TextEncoder();
-  const bytes = encoder.encode(seedMaterial);
-  const seed = new Uint8Array(32);
-  
-  for (let i = 0; i < 32; i++) {
-    let hash = 17;
-    for (let j = 0; j < bytes.length; j++) {
-      hash = (hash * 31 + bytes[j] + i) | 0;
-    }
-    seed[i] = Math.abs(hash) % 256;
-  }
-  
-  return StellarSdk.Keypair.fromRawEd25519Seed(seed as any);
-}
-
-/**
- * Requests funding from the testnet Friendbot for the specified address.
- */
-export async function fundWithFriendbot(address: string): Promise<boolean> {
+export function isValidPublicKey(key: string): boolean {
   try {
-    const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(address)}`);
-    return res.ok;
-  } catch (err) {
-    console.error('Friendbot funding failed:', err);
+    StellarSdk.StrKey.decodeEd25519PublicKey(key);
+    return true;
+  } catch {
     return false;
   }
 }
 
+export function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  // Stellar SDK error with extras
+  const e = error as any;
+  if (e?.response?.data?.extras?.result_codes) {
+    const codes = e.response.data.extras.result_codes;
+    return `Transaction failed: ${JSON.stringify(codes)}`;
+  }
+  return 'Something went wrong while completing the request.';
+}
+
+export async function fetchBalance(address: string): Promise<string> {
+  const account = await horizonServer.loadAccount(address);
+  const native = account.balances.find((b: any) => b.asset_type === 'native');
+  return native?.balance ?? '0';
+}
+
+export async function fundWithFriendbot(address: string): Promise<boolean> {
+  try {
+    const res = await fetch(`https://friendbot.stellar.org?addr=${encodeURIComponent(address)}`);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function fetchRecentTransactions(address: string): Promise<any[]> {
+  try {
+    const payments = await horizonServer.payments()
+      .forAccount(address)
+      .limit(8)
+      .order('desc')
+      .call();
+    return payments.records;
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Wraps an inner transaction XDR into a Fee-Bump transaction sponsored by the Gateway,
- * signs it with the sponsor's keypair, and submits it to Horizon.
+ * Build a payment transaction XDR from the given parameters.
+ * Returns the unsigned XDR string ready to be passed to Freighter.
  */
-export async function submitSponsoredTransaction(
-  innerTxXdr: string,
+export async function buildPaymentXdr(
+  sourceAddress: string,
+  destination: string,
+  amount: string
+): Promise<string> {
+  const account = await horizonServer.loadAccount(sourceAddress);
+  const tx = new StellarSdk.TransactionBuilder(account, {
+    fee: StellarSdk.BASE_FEE,
+    networkPassphrase: TESTNET_NETWORK_PASSPHRASE,
+  })
+    .addOperation(
+      StellarSdk.Operation.payment({
+        destination,
+        asset: StellarSdk.Asset.native(),
+        amount: Number(amount).toFixed(7),
+      })
+    )
+    .setTimeout(120)
+    .build();
+
+  return tx.toXDR();
+}
+
+/**
+ * Wraps a signed inner XDR inside a Fee-Bump transaction and broadcasts it.
+ * The sponsor keypair pays the network fee so the user pays 0.
+ */
+export async function submitFeeBumped(
+  signedInnerXdr: string,
   sponsorSecret: string
-): Promise<any> {
-  const horizonServer = new StellarSdk.Horizon.Server(TESTNET_HORIZON_URL);
+): Promise<StellarSdk.Horizon.HorizonApi.TransactionResponse> {
   const sponsorKeypair = StellarSdk.Keypair.fromSecret(sponsorSecret);
-  
-  // Reconstruct the inner transaction
   const innerTx = StellarSdk.TransactionBuilder.fromXDR(
-    innerTxXdr,
+    signedInnerXdr,
     TESTNET_NETWORK_PASSPHRASE
   ) as StellarSdk.Transaction;
-  
-  // Build the outer Fee-Bump transaction
-  // Base fee for the fee-bump must be at least innerTx.fee + 100 stroops
-  const feeBumpTx = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
+
+  const feeBump = StellarSdk.TransactionBuilder.buildFeeBumpTransaction(
     sponsorKeypair.publicKey(),
-    (Number(innerTx.fee) + 200).toString(), // sponsor pays fee + buffer
+    String(Number(innerTx.fee) + 200),
     innerTx,
     TESTNET_NETWORK_PASSPHRASE
   );
-  
-  // Sponsor signs the fee-bump
-  feeBumpTx.sign(sponsorKeypair);
-  
-  // Broadcast to testnet
-  return await horizonServer.submitTransaction(feeBumpTx);
+  feeBump.sign(sponsorKeypair);
+
+  return await horizonServer.submitTransaction(feeBump) as any;
 }
