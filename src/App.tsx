@@ -264,8 +264,11 @@ export default function App() {
     if (!regName.trim()) { setRegError('Name is required.'); return; }
     if (!regPhone.trim()) { setRegError('Phone number is required.'); return; }
     if (regPin.length !== 4) { setRegError('PIN must be exactly 4 digits.'); return; }
+    if (!regWalletAddr.trim()) {
+      setRegError('Please connect your Freighter Wallet first.'); return;
+    }
     if (!isValidPublicKey(regWalletAddr.trim())) {
-      setRegError('Enter a valid Stellar public key (starts with G, 56 chars).'); return;
+      setRegError('Failed to retrieve a valid Stellar public key from Freighter. Try reconnecting.'); return;
     }
     setRegLoading(true);
 
@@ -311,6 +314,21 @@ export default function App() {
     setIsRegistered(true);
     addLog(`SIM registered. Welcome, ${regName}!`, 'success');
     setRegLoading(false);
+  };
+
+  const connectFreighterForReg = async () => {
+    setRegLoading(true);
+    setRegError(null);
+    try {
+      const access = await freighter.requestAccess();
+      if (access?.error) throw new Error(access.error.message ?? 'Freighter denied access.');
+      setRegWalletAddr(access.address);
+      addLog(`Freighter connected during registration: ${formatAddress(access.address)}`, 'success');
+    } catch (e) {
+      setRegError(getErrorMessage(e));
+    } finally {
+      setRegLoading(false);
+    }
   };
 
   // ── Freighter ─────────────────────────────────────────────────────────────
@@ -505,35 +523,67 @@ export default function App() {
               </div>
 
               <div className="reg-field">
-                <label>
-                  Stellar Wallet Address <span className="reg-hint">(Your public key, starts with G)</span>
-                </label>
-                <input
-                  type="text"
-                  value={regWalletAddr}
-                  onChange={e => setRegWalletAddr(e.target.value)}
-                  placeholder="GXXXXXX…"
-                  required
-                  className={addrValid ? 'input--valid' : addrInvalid ? 'input--invalid' : ''}
-                />
-                {/* Live Friendbot status */}
-                {addrValid && regNetwork === 'testnet' && (
-                  <div className={`reg-derived ${friendbotStatus === 'active' || friendbotStatus === 'funded' ? '' : friendbotStatus === 'error' ? 'reg-derived--err' : ''}`}>
-                    {friendbotStatus === 'checking' && <span>🔍 Checking account on testnet…</span>}
-                    {friendbotStatus === 'active' && <><span className="reg-derived__label">✅ Account already active on testnet</span><span className="reg-derived__addr">Friendbot not needed — will log in directly.</span></>}
-                    {friendbotStatus === 'funded' && <><span className="reg-derived__label">✅ Funded by Friendbot!</span><span className="reg-derived__addr">10,000 XLM added to this address.</span></>}
-                    {friendbotStatus === 'error' && <span>❌ Could not check account status.</span>}
-                    {friendbotStatus === 'idle' && <><span className="reg-derived__label">✅ Valid Stellar address</span><span className="reg-derived__addr">{regWalletAddr}</span></>}
+                <label>Stellar Wallet Address</label>
+                {!regWalletAddr ? (
+                  <button
+                    type="button"
+                    className="primary-btn"
+                    style={{
+                      width: '100%',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      gap: '8px',
+                      padding: '12px 14px',
+                      fontWeight: 'bold',
+                      marginTop: '4px'
+                    }}
+                    onClick={connectFreighterForReg}
+                    disabled={regLoading}
+                  >
+                    🦊 Connect Freighter Wallet
+                  </button>
+                ) : (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginTop: '4px' }}>
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'space-between',
+                      background: 'rgba(56, 189, 248, 0.08)',
+                      border: '1px solid rgba(56, 189, 248, 0.25)',
+                      borderRadius: '12px',
+                      padding: '10px 14px'
+                    }}>
+                      <span style={{ fontSize: '0.85rem', fontFamily: 'monospace', wordBreak: 'break-all', color: '#38bdf8' }}>
+                        ✅ {formatAddress(regWalletAddr)}
+                      </span>
+                      <button
+                        type="button"
+                        className="ghost-btn"
+                        style={{ padding: '4px 10px', fontSize: '0.78rem', marginLeft: '10px', minWidth: 'fit-content' }}
+                        onClick={() => setRegWalletAddr('')}
+                      >
+                        Change
+                      </button>
+                    </div>
+
+                    {/* Live Friendbot status */}
+                    {addrValid && regNetwork === 'testnet' && (
+                      <div className={`reg-derived ${friendbotStatus === 'active' || friendbotStatus === 'funded' ? '' : friendbotStatus === 'error' ? 'reg-derived--err' : ''}`}>
+                        {friendbotStatus === 'checking' && <span>🔍 Checking account on testnet…</span>}
+                        {friendbotStatus === 'active' && <><span className="reg-derived__label">✅ Account already active on testnet</span><span className="reg-derived__addr">Friendbot not needed — will log in directly.</span></>}
+                        {friendbotStatus === 'funded' && <><span className="reg-derived__label">✅ Funded by Friendbot!</span><span className="reg-derived__addr">10,000 XLM added to this address.</span></>}
+                        {friendbotStatus === 'error' && <span>❌ Could not check account status.</span>}
+                        {friendbotStatus === 'idle' && <><span className="reg-derived__label">✅ Valid Stellar address</span><span className="reg-derived__addr">{regWalletAddr}</span></>}
+                      </div>
+                    )}
+                    {addrValid && regNetwork === 'mainnet' && (
+                      <div className="reg-derived">
+                        <span className="reg-derived__label">✅ Valid Stellar address</span>
+                        <span className="reg-derived__addr">Will verify on Mainnet Horizon. Ensure this address has XLM.</span>
+                      </div>
+                    )}
                   </div>
-                )}
-                {addrValid && regNetwork === 'mainnet' && (
-                  <div className="reg-derived">
-                    <span className="reg-derived__label">✅ Valid Stellar address</span>
-                    <span className="reg-derived__addr">Will verify on Mainnet Horizon. Ensure this address has XLM.</span>
-                  </div>
-                )}
-                {addrInvalid && (
-                  <div className="reg-derived reg-derived--err"><span>⚠️ Invalid address format</span></div>
                 )}
               </div>
 
