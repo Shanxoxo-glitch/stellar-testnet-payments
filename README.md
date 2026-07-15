@@ -103,21 +103,45 @@ In the prototype, the gateway sponsor is simulated client-side using a Friendbot
 
 ## 📸 Screenshots
 
-### 1. User Registration & Network Selector
-![User Registration](public/screenshots/01-wallet-connect.png)
-*Choose between Testnet and Mainnet, enter your name and phone number, and link your Stellar public key.*
+### 1. Registration Form — Connect Freighter Wallet
+![Registration Form](public/screenshots/01-registration-form.png)
+*Fill in your name, phone number, and PIN. Click **🦊 Connect Freighter Wallet** to link your Stellar address — no manual copy-pasting required.*
 
-### 2. Address Validation & Friendbot Activation
-![Address Validation](public/screenshots/02-connection-request.png)
-*The app performs a real-time account status check. If the address is not yet funded on testnet, Friendbot is automatically triggered to fund it with 10,000 XLM.*
+### 2. Freighter Unlock
+![Freighter Unlock](public/screenshots/02-freighter-unlock.png)
+*The Freighter browser extension opens and prompts you to unlock it with your password.*
 
-### 3. Interactive Main Dashboard
-![Interactive Main Dashboard](public/screenshots/03-confirm-transaction.png)
-*View your live wallet balance (auto-refreshes every 15 seconds), connect your Freighter wallet to sign transactions cryptographically, and monitor incoming/outgoing transfers.*
+### 3. Freighter Connection Request
+![Freighter Connection Request](public/screenshots/03-freighter-connect-request.png)
+*Freighter shows the wallet address and network (Testnet), asking permission to connect to the site.*
 
-### 4. Nokia 3310 USSD Simulator & Gateway Console
-![Nokia USSD Simulator](public/screenshots/04-transaction-success.png)
-*Dial `*123#` on the simulated Nokia 3310 to open the USSD menu. See cellular relayer logs output live in the Gateway Broadcast Console.*
+### 4. Wallet Connected — Account Validated
+![Wallet Connected](public/screenshots/04-wallet-connected.png)
+*Once approved, the address auto-fills in the form and the app immediately checks if the account is active on testnet. Friendbot is called automatically if needed.*
+
+### 5. Dashboard — Live Balance Displayed
+![Dashboard Balance](public/screenshots/05-dashboard-balance.png)
+*The main dashboard shows the live XLM balance fetched from Horizon (10,099 XLM), the registered wallet address, and the Freighter connect button to sign transactions.*
+
+### 6. USSD Simulator — Entering Send Amount
+![USSD Send Amount](public/screenshots/06-ussd-send-amount.png)
+*Dial `*123#` on the Nokia 3310 simulator, select Send XLM, choose a contact, and enter the amount. The gateway console shows live relay logs.*
+
+### 7. USSD Simulator — Enter PIN to Confirm
+![USSD Enter PIN](public/screenshots/07-ussd-enter-pin.png)
+*The phone prompts for a 4-digit PIN to confirm the payment before broadcasting the transaction.*
+
+### 8. Freighter — Confirm Transaction Signature
+![Freighter Confirm Transaction](public/screenshots/08-freighter-confirm-tx.png)
+*Freighter pops up showing the transaction details (wallet, network, fee). The user clicks Confirm to cryptographically sign the XDR.*
+
+### 9. Broadcast Console — Transaction Hash
+![Transaction Hash Console](public/screenshots/09-tx-hash-console.png)
+*The Gateway console shows the full transaction flow: XDR built → Freighter signed → Fee-Bump wrapped → Broadcast to Ledger 3618697. The real transaction hash is displayed with a View on Stellar.Expert link.*
+
+### 10. Nokia Screen — ✅ Sent! Success State
+![Transaction Success](public/screenshots/10-tx-success.png)
+*The Nokia screen confirms **✅ Sent!** with the transaction hash. The Broadcast Console shows the updated wallet balance (10,098 XLM) and the transaction appears in the Transaction History.*
 
 ---
 
