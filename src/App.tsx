@@ -130,6 +130,7 @@ export default function App() {
   // --- Balance ---
   const [walletBalance, setWalletBalance] = useState('0');
   const [balanceLoading, setBalanceLoading] = useState(false);
+  const [faucetLoading, setFaucetLoading] = useState(false);
   const [lastBalanceAt, setLastBalanceAt] = useState<Date | null>(null);
   const balancePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -208,6 +209,28 @@ export default function App() {
       setWalletBalance('0');
     } finally { setBalanceLoading(false); }
   }, []);
+
+  const fundWallet = async () => {
+    if (!activeAddress || network !== 'testnet') return;
+    setFaucetLoading(true);
+    addLog(`Calling Friendbot to fund active wallet: ${formatAddress(activeAddress)}…`, 'info');
+    try {
+      const res = await fundWithFriendbot(activeAddress, 'testnet');
+      if (res === 'funded') {
+        addLog('✅ Wallet successfully funded with 10,000 XLM!', 'success');
+        await refreshBalance(activeAddress, 'testnet');
+      } else if (res === 'already_exists') {
+        addLog('✅ Wallet is already active on-chain.', 'success');
+        await refreshBalance(activeAddress, 'testnet');
+      } else {
+        addLog('❌ Friendbot funding failed. Please try again.', 'error');
+      }
+    } catch (e) {
+      addLog(`❌ Faucet error: ${getErrorMessage(e)}`, 'error');
+    } finally {
+      setFaucetLoading(false);
+    }
+  };
 
   useEffect(() => {
     if (!isRegistered || !activeAddress || !profile) return;
@@ -649,6 +672,30 @@ export default function App() {
                 : 'Loading…'}
             </div>
             <div className="balance-hero__addr">{activeAddress}</div>
+            {network === 'testnet' && (
+              <button
+                className="ghost-btn"
+                style={{
+                  marginTop: '12px',
+                  width: '100%',
+                  borderColor: 'rgba(56, 189, 248, 0.4)',
+                  color: '#38bdf8',
+                  fontSize: '0.82rem',
+                  padding: '8px 12px',
+                  borderRadius: '8px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '6px',
+                  background: 'rgba(56, 189, 248, 0.03)',
+                  cursor: 'pointer'
+                }}
+                onClick={fundWallet}
+                disabled={faucetLoading}
+              >
+                🎁 {faucetLoading ? 'Funding from Friendbot…' : 'Fund Active Wallet (10,000 Testnet XLM)'}
+              </button>
+            )}
           </div>
         </div>
 
